@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <gpiod.h>
 
 #include "../shared/shm_types.h"
@@ -122,7 +123,8 @@ int main(void) {
       }
     }
 
-    atomic_fetch_add(&shm->iteration, 1);
+    uint32_t iter = atomic_fetch_add(&shm->iteration, 1) + 1;
+    printf("iteration: %u\n", iter);
     atomic_store(&shm->watchdog_alarm, false);
 
     float d1 = atomic_load(&shm->duty1);
