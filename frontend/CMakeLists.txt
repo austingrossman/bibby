@@ -3,6 +3,7 @@ include(FetchContent)
 set(SDL_SHARED             OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC             ON  CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON  CACHE BOOL "" FORCE)
+set(SDL_LIBINPUT           ON  CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     SDL3
@@ -34,9 +35,12 @@ target_include_directories(frontend PRIVATE
     ${IMGUI_DIR}/backends
 )
 
-find_package(OpenGL REQUIRED)
+# GLES3 on Pi — no desktop OpenGL needed
+target_compile_definitions(frontend PRIVATE IMGUI_IMPL_OPENGL_ES3)
+
+find_library(GLESV2_LIB GLESv2 REQUIRED)
 target_link_libraries(frontend PRIVATE
     SDL3::SDL3-static
-    OpenGL::GL
+    ${GLESV2_LIB}
     rt
 )

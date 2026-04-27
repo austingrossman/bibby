@@ -110,6 +110,10 @@ int main(void) {
     if (ret == 0) {
       if (!atomic_load(&shm->simulate_zc)) {
         atomic_store(&shm->watchdog_alarm, true);
+        gpiod_line_request_set_value(out_req, GPIO_SSR1, GPIOD_LINE_VALUE_INACTIVE);
+        gpiod_line_request_set_value(out_req, GPIO_SSR2, GPIOD_LINE_VALUE_INACTIVE);
+        atomic_store(&shm->output1, false);
+        atomic_store(&shm->output2, false);
         continue;
       }
       // simulated ZC — fall through to normal ZC handling
