@@ -10,6 +10,7 @@
 #include <gpiod.h>
 
 #include "../shared/shm_types.h"
+#include "../shared/single_instance.h"
 
 // GPIO chip and line numbers — adjust for your wiring
 #define GPIO_CHIP        "/dev/gpiochip4"   // Pi 5
@@ -20,6 +21,11 @@
 // Number of ZC cycles with no frontend_iteration change before duties are forced to zero.
 // At 60 Hz mains this is ~2 seconds.
 #define FRONTEND_WATCHDOG_ZC 120
+
+// Number of nanoseconds to wait for zero crossing event before causing watchdog_alarm
+// When simulating ZC, this is the period of the simulation
+// This should update to 11.5ms if running on 50Hz grid.
+#define ZC_WATCHDOG_ALARM_NS 9000000ULL
 
 static volatile sig_atomic_t running = 1;
 
@@ -47,6 +53,13 @@ static HeaterShm *shm_open_map(void) {
 int main(void) {
   signal(SIGINT, handle_sigint);
   signal(SIGTERM, handle_sigint);
+
+  // Refuse to start if another heater-controller is already running.
+  // Lock fd is intentionally left open for the life of the process.
+  if (single_instance_lock("/tmp/biab_heater.lock") < 0) {
+    fprintf(stderr, "heater-controller: another instance is already running\n");
+    return 1;
+  }
 
   HeaterShm *shm = shm_open_map();
   atomic_store(&shm->output1, false);
@@ -109,7 +122,7 @@ int main(void) {
   bool     frontend_seen      = false;
 
   while (running) {
-    int ret = gpiod_line_request_wait_edge_events(zc_req, 9000000ULL);
+    int ret = gpiod_line_request_wait_edge_events(zc_req, ZC_WATCHDOG_ALARM_NS);
     if (ret < 0) {
       perror("wait_edge_events");
       break;
@@ -199,6 +212,11 @@ int main(void) {
   gpiod_line_request_release(zc_req);
   gpiod_line_request_release(out_req);
   gpiod_chip_close(chip);
-  shm_unlink(SHM_NAME);
+  // Do not shm_unlink here: the frontend may still be mapped to this segment.
+  // Unlinking removes the name while the old inode lives on in the frontend's
+  // mapping; a restarted heater-controller would then O_CREAT a fresh, separate
+  // inode and the two processes would silently stop sharing memory. Leaving the
+  // named object in /dev/shm lets a restart reattach to the same segment.
+  munmap(shm, sizeof(HeaterShm));
   return 0;
 }

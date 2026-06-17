@@ -11,6 +11,7 @@
 #include <imgui_impl_opengl3.h>
 
 #include "../shared/shm_types.h"
+#include "../shared/single_instance.h"
 #include "sensors/max31865.h"
 #include "temp_filter.h"
 #include "display.h"
@@ -39,6 +40,13 @@ static void                draw_ui(int portrait_w, int portrait_h, const UiStatu
 
 // ----------------------------------------------------------------------------
 int main(void) {
+  // Refuse to start if another frontend is already running.
+  // Lock fd is intentionally left open for the life of the process.
+  if (single_instance_lock("/tmp/biab_frontend.lock") < 0) {
+    fprintf(stderr, "frontend: another instance is already running\n");
+    return 1;
+  }
+
   SDL_GLContext gl_ctx;
   int display_w, display_h;
   SDL_Window *window = create_window(&gl_ctx, &display_w, &display_h);
