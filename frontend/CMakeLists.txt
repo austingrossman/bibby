@@ -25,6 +25,8 @@ set(IMGUI_SOURCES
 
 add_executable(frontend
     main.cpp
+    display.cpp
+    temp_filter.cpp
     sensors/max31865.cpp
     ${IMGUI_SOURCES}
 )
@@ -39,8 +41,10 @@ target_include_directories(frontend PRIVATE
 target_compile_definitions(frontend PRIVATE IMGUI_IMPL_OPENGL_ES3)
 
 find_library(GLESV2_LIB GLESv2 REQUIRED)
+find_library(GPIOD_LIB gpiod REQUIRED)
 target_link_libraries(frontend PRIVATE
     SDL3::SDL3-static
     ${GLESV2_LIB}
+    ${GPIOD_LIB}
     rt
 )

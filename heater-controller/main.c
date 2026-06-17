@@ -17,6 +17,10 @@
 #define GPIO_SSR1        21                 // SSR 1 output
 #define GPIO_SSR2        26                 // SSR 2 output
 
+// Number of ZC cycles with no frontend_iteration change before duties are forced to zero.
+// At 60 Hz mains this is ~2 seconds.
+#define FRONTEND_WATCHDOG_ZC 120
+
 static volatile sig_atomic_t running = 1;
 
 static void handle_sigint(int sig) { (void)sig; running = 0; }
@@ -50,6 +54,7 @@ int main(void) {
   atomic_store(&shm->watchdog_alarm, false);
   atomic_store(&shm->simulate_zc, false);
   atomic_store(&shm->iteration, 0);
+  atomic_store(&shm->frontend_iteration, 0);
 
   struct gpiod_chip *chip = gpiod_chip_open(GPIO_CHIP);
   if (!chip) {
@@ -98,7 +103,10 @@ int main(void) {
     exit(1);
   }
 
-  float acc1 = 0.0f, acc2 = 0.0f;
+  float    acc1 = 0.0f, acc2 = 0.0f;
+  uint32_t last_frontend_iter = 0;
+  uint32_t frontend_stale_zc  = 0;
+  bool     frontend_seen      = false;
 
   while (running) {
     int ret = gpiod_line_request_wait_edge_events(zc_req, 9000000ULL);
@@ -142,6 +150,20 @@ int main(void) {
       d2 = 0.0f;
     } else if (d2 > 1.0f) {
       d2 = 1.0f;
+    }
+
+    // Frontend heartbeat watchdog
+    uint32_t fe_iter = atomic_load(&shm->frontend_iteration);
+    if (fe_iter != last_frontend_iter) {
+      last_frontend_iter = fe_iter;
+      frontend_stale_zc  = 0;
+      frontend_seen      = true;
+    } else if (frontend_seen) {
+      frontend_stale_zc++;
+    }
+    if (frontend_seen && frontend_stale_zc >= FRONTEND_WATCHDOG_ZC) {
+      d1 = 0.0f;
+      d2 = 0.0f;
     }
 
     acc1 += d1;
