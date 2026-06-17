@@ -5967,7 +5967,7 @@
 		)
 		(uuid "c27cd311-6dbe-4989-9cc9-6c72b074b2e4")
 	)
-	(label "GPIO14{slash}TXD0{slash}CS"
+	(label "GPIO8{slash}SPI0.CE0"
 		(at 137.16 62.23 0)
 		(effects
 			(font
