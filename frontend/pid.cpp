@@ -25,6 +25,17 @@ float PidController::update(float temp_c, float setpoint_c) {
   prev_error_ = error;
   has_prev_   = true;
 
-  float out = kp_ * error + ki_ * integral_ + kd_ * deriv;
-  return clampf(out, 0.0f, 1.0f);
+  float p   = kp_ * error;
+  float i   = ki_ * integral_;
+  float d   = kd_ * deriv;
+  float out = clampf(p + i + d, 0.0f, 1.0f);
+
+  terms_.error    = error;
+  terms_.p        = p;
+  terms_.i        = i;
+  terms_.d        = d;
+  terms_.integral = integral_;
+  terms_.deriv    = deriv;
+  terms_.output   = out;
+  return out;
 }

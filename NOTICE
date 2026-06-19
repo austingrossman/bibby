@@ -1,0 +1,17 @@
+bibby — Brew In A Bag Temperature Ramp Controller
+Copyright 2026 Austin Grossman
+
+This product includes software developed by third parties under their own
+licenses:
+
+  Dear ImGui (third_party/imgui/)
+  Copyright (c) 2014-2024 Omar Cornut
+  MIT License — see third_party/imgui/LICENSE.txt
+
+  SDL3 (fetched at build time via CMake FetchContent)
+  Copyright (C) 1997-2024 Sam Lantinga
+  zlib License — https://www.libsdl.org/
+
+  libgpiod (dynamically linked)
+  Copyright (C) 2017-2023 Bartosz Golaszewski
+  GNU Lesser General Public License v2.1 or later

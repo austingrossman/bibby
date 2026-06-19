@@ -4,13 +4,24 @@
 
 static const float PI = 3.14159265358979f;
 
-// Stroke a polyline as a heating element: a soft halo underneath when energised,
-// then the solid core. `on` selects a hot orange over a cold, dim tint.
-static void draw_element(ImDrawList *dl, const ImVec2 *pts, int n, bool on, float th) {
-  const ImU32 core = on ? IM_COL32(255, 150, 40, 255) : IM_COL32(82, 72, 66, 255);
-  if (on) {
-    dl->AddPolyline(pts, n, IM_COL32(255, 110, 20, 45), 0, th * 3.0f);
-    dl->AddPolyline(pts, n, IM_COL32(255, 130, 30, 70), 0, th * 1.9f);
+static float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+
+// Linear blend between two packed ImU32 colours, component-wise.
+static ImU32 lerp_color(ImU32 a, ImU32 b, float t) {
+  auto ch = [](ImU32 c, int s) { return (int)((c >> s) & 0xFF); };
+  auto mix = [&](int s) { return (int)(ch(a, s) + (ch(b, s) - ch(a, s)) * t); };
+  return IM_COL32(mix(IM_COL32_R_SHIFT), mix(IM_COL32_G_SHIFT),
+                  mix(IM_COL32_B_SHIFT), mix(IM_COL32_A_SHIFT));
+}
+
+// Stroke a polyline as a heating element: a soft halo underneath that grows with
+// `bright`, then the solid core blended from a cold tint to a hot orange.
+static void draw_element(ImDrawList *dl, const ImVec2 *pts, int n, float bright, float th) {
+  bright = clamp01(bright);
+  const ImU32 core = lerp_color(IM_COL32(82, 72, 66, 255), IM_COL32(255, 150, 40, 255), bright);
+  if (bright > 0.01f) {
+    dl->AddPolyline(pts, n, IM_COL32(255, 110, 20, (int)(45.0f * bright)), 0, th * 3.0f);
+    dl->AddPolyline(pts, n, IM_COL32(255, 130, 30, (int)(70.0f * bright)), 0, th * 1.9f);
   }
   dl->AddPolyline(pts, n, core, 0, th);
 }
@@ -31,7 +42,7 @@ static void draw_grain_speckle(ImDrawList *dl, float x0, float y0, float x1, flo
 }
 
 void draw_kettle(ImDrawList *dl, ImVec2 top_left, ImVec2 size,
-                 bool out1, bool out2, bool grain_in) {
+                 float bright1, float bright2, bool grain_in, float content_top) {
   const float margin = size.x * 0.08f;
   const float kx0    = top_left.x + margin;
   const float kx1    = top_left.x + size.x - margin;
@@ -44,6 +55,7 @@ void draw_kettle(ImDrawList *dl, ImVec2 top_left, ImVec2 size,
   const ImU32 col_steel   = IM_COL32(58, 62, 70, 255);
   const ImU32 col_outline = IM_COL32(110, 116, 128, 255);
   const ImU32 col_lip     = IM_COL32(92, 98, 110, 255);
+  const ImU32 col_empty   = IM_COL32(40, 43, 49, 255); // bare interior above the liquid
   const ImU32 col_liquid  = IM_COL32(96, 64, 26, 210);
   const ImU32 col_grain   = IM_COL32(150, 120, 70, 255);
 
@@ -59,14 +71,22 @@ void draw_kettle(ImDrawList *dl, ImVec2 top_left, ImVec2 size,
   const float iy1    = ky1 - wt;
   const float iround = round * 0.7f;
 
-  dl->AddRectFilled(ImVec2(ix0, iy0), ImVec2(ix1, iy1), col_liquid, iround,
+  // The contents surface sits at `content_top` (kept below the temperature
+  // readout), clamped into the interior. Bare interior above it, liquid below.
+  float surf = content_top;
+  if (surf < iy0) surf = iy0;
+  if (surf > iy1) surf = iy1;
+
+  dl->AddRectFilled(ImVec2(ix0, iy0), ImVec2(ix1, iy1), col_empty, iround,
+                    ImDrawFlags_RoundCornersBottom);
+  dl->AddRectFilled(ImVec2(ix0, surf), ImVec2(ix1, iy1), col_liquid, iround,
                     ImDrawFlags_RoundCornersBottom);
 
-  // Grain bed fills the upper two-thirds of the contents when present.
-  const float y_div = iy0 + (iy1 - iy0) * 0.62f;
+  // Grain bed fills the upper two-thirds of the contents (below the surface).
+  const float y_div = surf + (iy1 - surf) * 0.62f;
   if (grain_in) {
-    dl->AddRectFilled(ImVec2(ix0, iy0), ImVec2(ix1, y_div), col_grain);
-    draw_grain_speckle(dl, ix0, iy0, ix1, y_div, kw * 0.013f);
+    dl->AddRectFilled(ImVec2(ix0, surf), ImVec2(ix1, y_div), col_grain);
+    draw_grain_speckle(dl, ix0, surf, ix1, y_div, kw * 0.013f);
   }
 
   // --- Heating elements, in the lower third over the liquid ---
@@ -75,25 +95,38 @@ void draw_kettle(ImDrawList *dl, ImVec2 top_left, ImVec2 size,
   const float xL = ix0 + kw * 0.12f;
   const float xR = ix1 - kw * 0.05f; // elements enter through the right wall
 
-  // SSR1 — sling-blade immersion element: two legs joined by a left U-bend.
+  // SSR1 — sling-blade immersion element: two legs joined by a left U-bend. Both
+  // legs bow the same way (parallel curves) so the blade reads like a scythe.
   {
     const float yc  = y_div + bh * 0.40f;
     const float gap = bh * 0.30f;
     const float r   = gap * 0.5f;
     const float ya  = yc - r;
     const float yb  = yc + r;
-    const float xb  = xL + r; // U-bend center x
+    const float xb  = xL + r;        // U-bend center x
+    const float bow = bh * 0.08f;    // leg curvature depth (both legs, same sign)
 
-    ImVec2 pts[20];
+    ImVec2 pts[48];
     int    n = 0;
-    pts[n++] = ImVec2(xR, ya);
+    const int leg = 12;
+    // Top leg: right wall -> U-bend, bowed upward.
+    for (int i = 0; i <= leg; i++) {
+      float fx = (float)i / (float)leg;
+      pts[n++] = ImVec2(xR + (xb - xR) * fx, ya - bow * sinf(PI * fx));
+    }
+    // U-bend: top -> left -> bottom.
     const int arc = 12;
-    for (int i = 0; i <= arc; i++) {
-      float a = -PI * 0.5f - PI * (float)i / (float)arc; // top -> left -> bottom
+    for (int i = 1; i < arc; i++) {
+      float a = -PI * 0.5f - PI * (float)i / (float)arc;
       pts[n++] = ImVec2(xb + r * cosf(a), yc + r * sinf(a));
     }
-    pts[n++] = ImVec2(xR, yb);
-    draw_element(dl, pts, n, out1, th);
+    // Bottom leg: U-bend -> right wall, bowed the same way as the top leg. At
+    // matching x the two legs share the same bow, so they stay parallel.
+    for (int i = 0; i <= leg; i++) {
+      float fx = (float)i / (float)leg;
+      pts[n++] = ImVec2(xb + (xR - xb) * fx, yb - bow * sinf(PI * fx));
+    }
+    draw_element(dl, pts, n, bright1, th);
   }
 
   // SSR2 — ripple element: a sine wave across the bottom of the contents.
@@ -106,7 +139,7 @@ void draw_kettle(ImDrawList *dl, ImVec2 top_left, ImVec2 size,
       float fx = (float)i / (float)N;
       pts[i] = ImVec2(xL + (xR - xL) * fx, yc + amp * sinf(2.0f * PI * 3.5f * fx));
     }
-    draw_element(dl, pts, N + 1, out2, th);
+    draw_element(dl, pts, N + 1, bright2, th);
   }
 
   // Body outline and a top lip across both walls.

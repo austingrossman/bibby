@@ -28,6 +28,8 @@ add_executable(frontend
     display.cpp
     temp_filter.cpp
     pid.cpp
+    csv_logger.cpp
+    ${CMAKE_SOURCE_DIR}/shared/config.c
     sensors/max31865.cpp
     gui/kettle.cpp
     gui/temp_history.cpp
@@ -44,18 +46,22 @@ target_include_directories(frontend PRIVATE
 # GLES3 on Pi — no desktop OpenGL needed.
 # FONT_DIR lets the frontend load the vendored TTFs regardless of the runtime cwd.
 #
-# HEATER_CONTROLLER_PATH is the absolute build-tree path of the sibling binary so
-# the frontend always launches the freshly built controller during development.
+# BIBBY_PATH is the absolute build-tree path of the sibling binary so the
+# frontend always launches the freshly built controller during development.
 #
 # TODO(install): this path is NOT relocatable — after `make install` it still
 # points into the build tree, which may not exist on the target. Before adding
 # any install() rule, switch this to runtime resolution (resolve /proc/self/exe,
 # look for the sibling, fall back to a PATH search) or to
 # ${CMAKE_INSTALL_FULL_BINDIR}. See memory: install-relocatable-heater-path.
+# BIBBY_CONFIG is the default ini location, overridable at runtime via the
+# $BIBBY_CONFIG environment variable (see shared/config.c). Like the paths above
+# it is baked to the build/source tree and not yet relocatable for install.
 target_compile_definitions(frontend PRIVATE
     IMGUI_IMPL_OPENGL_ES3
     FONT_DIR="${IMGUI_DIR}/misc/fonts"
-    HEATER_CONTROLLER_PATH="$<TARGET_FILE:heater-controller>"
+    BIBBY_PATH="$<TARGET_FILE:heater-controller>"
+    BIBBY_CONFIG="${CMAKE_SOURCE_DIR}/bibby.ini"
 )
 
 find_library(GLESV2_LIB GLESv2 REQUIRED)

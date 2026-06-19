@@ -47,8 +47,12 @@ static void spi_transfer(int fd, const uint8_t *tx, uint8_t *rx, size_t len) {
   }
 }
 
-Max31865::Max31865(const std::string &path, int ref_resistor, gpiod_line_request *drdy_req)
-  : ref_resistor_(ref_resistor), drdy_req_(drdy_req) {
+Max31865::Max31865(const std::string &path, float ref_resistor,
+                   gpiod_line_request *drdy_req, int mains_hz,
+                   float temp_cal_gain, float temp_cal_offset)
+  : ref_resistor_(ref_resistor),
+    temp_cal_gain_(temp_cal_gain), temp_cal_offset_(temp_cal_offset),
+    drdy_req_(drdy_req) {
 
   last_temp_read_ = 0;
 
@@ -64,8 +68,14 @@ Max31865::Max31865(const std::string &path, int ref_resistor, gpiod_line_request
   uint8_t mode = SPI_MODE_1;
   ioctl(fd_, SPI_IOC_WR_MODE, &mode);
 
-  // Enable 60Hz filter, 3-wire, clear fault status, normally off
-  cfg_reg_ |= CONFIG_3WIRE | CONFIG_FAULT_CLEAR;
+  // Config bit 0 selects the mains-noise rejection notch: set = 50 Hz,
+  // clear = 60 Hz. It must be chosen here, before auto-conversion is enabled
+  // below (the datasheet forbids changing it during auto-conversion). The bit
+  // persists in cfg_reg_ through the later VBIAS/auto writes and clear_faults().
+  uint8_t filter_bit = (mains_hz == 50) ? CONFIG_50_HZ_FILTER : 0;
+
+  // 3-wire, mains filter, clear fault status, normally off
+  cfg_reg_ |= CONFIG_3WIRE | CONFIG_FAULT_CLEAR | filter_bit;
   tx[0] = REG_CONFIG | 0x80;
   tx[1] =  cfg_reg_;
   spi_transfer(fd_, tx, rx, 2);
@@ -131,13 +141,20 @@ float Max31865::read_temperature(bool *is_fresh) {
   }
 
   raw >>= 1;
-  float rtd = ((float)raw / 32768.0f) * (float)ref_resistor_;
+  float rtd = ((float)raw / 32768.0f) * ref_resistor_;
 
   // Callendar-Van Dusen approximation (valid -200–850 °C)
   static constexpr float A = 3.9083e-3f;
   static constexpr float B = -5.775e-7f;
   float r0   = rtd_nominal_;
   float temp = (-A + sqrtf(A * A - 4.0f * B * (1.0f - rtd / r0))) / (2.0f * B);
+
+  // Per-unit probe-gain calibration (sensor.temp_cal_gain/offset in bibby.ini).
+  // With Rref already trimmed at the ice point, a probe may still read low/high
+  // in span (probe alpha mismatch). The error is proportional to T, so it is
+  // corrected here in the temperature domain, not via Rref which scales
+  // resistance. See README §9.2 for the two-point derivation.
+  temp = temp_cal_gain_ * temp + temp_cal_offset_;
   last_temp_read_ = temp;
   if (is_fresh) *is_fresh = true;
   return last_temp_read_;

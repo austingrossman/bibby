@@ -6,9 +6,17 @@ struct gpiod_line_request;
 
 class Max31865 {
 public:
+  // mains_hz selects the sensor's noise-rejection filter notch (50 or 60 Hz);
+  // it must match the local AC line frequency to reject mains pickup.
+  // ref_resistor / temp_cal_gain / temp_cal_offset are the per-unit RTD
+  // calibration constants loaded from bibby.ini (identity defaults leave the
+  // sensor uncalibrated); see README §9 for how each is derived.
   explicit Max31865(const std::string &spidev_path,
-                    int ref_resistor = 400,
-                    gpiod_line_request *drdy_req = nullptr);
+                    float ref_resistor = 400.0f,
+                    gpiod_line_request *drdy_req = nullptr,
+                    int mains_hz = 60,
+                    float temp_cal_gain = 1.0f,
+                    float temp_cal_offset = 0.0f);
   // Returns °C. If is_fresh is non-null, *is_fresh is set to true when a new,
   // valid conversion was read this call, or false when DRDY was not ready or
   // the conversion was flagged faulty — in both cases the previous (stale)
@@ -28,8 +36,12 @@ public:
 
 private:
   int                  fd_;
-  int                  ref_resistor_;
+  float                ref_resistor_;
   float                rtd_nominal_ = 100.0f; // PT100
+  // Per-unit two-point probe-gain calibration applied to the CVD output, loaded
+  // from bibby.ini (see README §9). Identity defaults = uncalibrated.
+  float                temp_cal_gain_;
+  float                temp_cal_offset_;
   uint8_t              cfg_reg_;
   gpiod_line_request  *drdy_req_;
   float                last_temp_read_;

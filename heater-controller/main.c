@@ -11,6 +11,7 @@
 
 #include "../shared/shm_types.h"
 #include "../shared/single_instance.h"
+#include "../shared/config.h"
 
 // GPIO chip and line numbers — adjust for your wiring
 #define GPIO_CHIP        "/dev/gpiochip4"   // Pi 5
@@ -18,14 +19,9 @@
 #define GPIO_SSR1        21                 // SSR 1 output
 #define GPIO_SSR2        26                 // SSR 2 output
 
-// Number of ZC cycles with no frontend_iteration change before duties are forced to zero.
-// At 60 Hz mains this is ~2 seconds.
-#define FRONTEND_WATCHDOG_ZC 120
-
-// Number of nanoseconds to wait for zero crossing event before causing watchdog_alarm
-// When simulating ZC, this is the period of the simulation
-// This should update to 11.5ms if running on 50Hz grid.
-#define ZC_WATCHDOG_ALARM_NS 9000000ULL
+// The zero-cross watchdog timeout (also the simulated-ZC period) and the
+// frontend-stale ZC count are both derived from the mains frequency in the ini
+// file at startup; see config_zc_timeout_ns / config_frontend_watchdog_zc.
 
 static volatile sig_atomic_t running = 1;
 
@@ -60,6 +56,14 @@ int main(void) {
     fprintf(stderr, "heater-controller: another instance is already running\n");
     return 1;
   }
+
+  BibbyConfig cfg;
+  bool cfg_found = config_load(&cfg, NULL);
+  uint64_t zc_timeout_ns      = config_zc_timeout_ns(&cfg);
+  uint32_t frontend_watchdog  = config_frontend_watchdog_zc(&cfg);
+  fprintf(stderr, "heater-controller: %d Hz mains, ZC watchdog %.1f ms%s\n",
+          cfg.mains_hz, zc_timeout_ns / 1e6,
+          cfg_found ? "" : " (config not found, using defaults)");
 
   HeaterShm *shm = shm_open_map();
   // The shm segment persists across restarts (never unlinked), so duty1/duty2
@@ -128,7 +132,7 @@ int main(void) {
   bool     frontend_seen      = false;
 
   while (running) {
-    int ret = gpiod_line_request_wait_edge_events(zc_req, ZC_WATCHDOG_ALARM_NS);
+    int ret = gpiod_line_request_wait_edge_events(zc_req, zc_timeout_ns);
     if (ret < 0) {
       perror("wait_edge_events");
       break;
@@ -180,7 +184,7 @@ int main(void) {
     } else if (frontend_seen) {
       frontend_stale_zc++;
     }
-    if (frontend_seen && frontend_stale_zc >= FRONTEND_WATCHDOG_ZC) {
+    if (frontend_seen && frontend_stale_zc >= frontend_watchdog) {
       d1 = 0.0f;
       d2 = 0.0f;
     }

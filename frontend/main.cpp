@@ -16,9 +16,11 @@
 
 #include "../shared/shm_types.h"
 #include "../shared/single_instance.h"
+#include "../shared/config.h"
 #include "sensors/max31865.h"
 #include "temp_filter.h"
 #include "pid.h"
+#include "csv_logger.h"
 #include "display.h"
 #include "gui/kettle.h"
 #include "gui/temp_history.h"
@@ -27,8 +29,8 @@
   #define FONT_DIR "third_party/imgui/misc/fonts"
 #endif
 
-#ifndef HEATER_CONTROLLER_PATH
-  #define HEATER_CONTROLLER_PATH "heater-controller"
+#ifndef BIBBY_PATH
+  #define BIBBY_PATH "heater-controller"
 #endif
 
 // MAX31865 DRDY input, GPIO 16 (header pin 36), active-low.
@@ -49,6 +51,7 @@ static float   g_sz_large = 88.0f;
 struct UiStatus {
   float   temp_c;
   bool    out1, out2;
+  float   bright1, bright2; // element glow, IIR-smoothed from out1/out2, [0,1]
   bool    watchdog;
   bool    drdy_high;
   uint8_t rtd_fault; // MAX31865 Fault Status register (07h); 0 = no fault
@@ -80,6 +83,12 @@ int main(void) {
     return 1;
   }
 
+  // Load user configuration (mains, element specs, PID gains) before anything
+  // else; the heater-controller reads the same file when we launch it below.
+  BibbyConfig cfg;
+  if (!config_load(&cfg, nullptr))
+    fprintf(stderr, "frontend: config not found, using defaults\n");
+
   // The heater-controller must be up before we attach to its shared memory.
   ensure_heater_controller();
 
@@ -95,13 +104,19 @@ int main(void) {
   gpiod_chip *drdy_chip = gpiod_chip_open("/dev/gpiochip4");
   gpiod_line_request *drdy_req = init_drdy_line(drdy_chip);
 
-  Max31865 sensor("/dev/spidev0.0", 400, drdy_req);
+  // Per-unit RTD calibration (Rref ice-point trim + two-point span gain/offset)
+  // comes from bibby.ini so recalibrating never needs a rebuild. See README §9.
+  Max31865 sensor("/dev/spidev0.0", cfg.sensor_ref_resistor_ohms, drdy_req,
+                  cfg.mains_hz, cfg.sensor_temp_cal_gain, cfg.sensor_temp_cal_offset);
   SecondOrderAverage temp_filter(TEMP_FILTER_WINDOW);
   TempHistory temp_history;
-  PidController pid;
+  PidController pid(cfg.pid_kp, cfg.pid_ki, cfg.pid_kd);
+  CsvLogger logger;
+  if (logger.ok()) fprintf(stderr, "frontend: logging to %s\n", logger.path());
 
   ImGuiIO &io = ImGui::GetIO();
   float duty1 = 0.0f, duty2 = 0.0f;
+  float bright1 = 0.0f, bright2 = 0.0f;  // element glow, IIR-smoothed from outputs
   float pid_duty = 0.0f;  // latest PID power command; held between fresh samples
   float temp_c = 0.0f;
   bool  test_pressed   = false;
@@ -157,9 +172,33 @@ int main(void) {
     status.temp_c    = temp_c;
     status.out1      = shm->output1;
     status.out2      = shm->output2;
+    // Glow ramps toward each output with a one-pole IIR:
+    //   bright[n] = damp*output[n] + (1-damp)*bright[n-1].
+    constexpr float damp_factor = 0.2f;
+    bright1 += damp_factor * ((status.out1 ? 1.0f : 0.0f) - bright1);
+    bright2 += damp_factor * ((status.out2 ? 1.0f : 0.0f) - bright2);
+    status.bright1   = bright1;
+    status.bright2   = bright2;
     status.watchdog  = shm->watchdog_alarm;
     status.drdy_high = gpiod_line_request_get_value(drdy_req, DRDY_GPIO) == GPIOD_LINE_VALUE_ACTIVE;
     status.rtd_fault = rtd_fault;
+
+    // --- Log one row per fresh sample (PID has just run on this sample) ---
+    if (temp_fresh && logger.ok()) {
+      LogSample row;
+      row.t_monotonic_s = now;
+      row.temp_raw_c    = temp_raw;
+      row.temp_filt_c   = temp_c;
+      row.setpoint_c    = setpoint_c;
+      row.duty1         = duty1;
+      row.duty2         = duty2;
+      row.pid           = pid.terms();
+      row.manual        = manual_control;
+      row.grain_in      = grain_in;
+      row.rtd_fault     = rtd_fault;
+      row.watchdog      = status.watchdog;
+      logger.log(row);
+    }
 
     // --- Render the UI into the portrait FBO ---
     display.begin_frame();
@@ -262,7 +301,7 @@ static void ensure_heater_controller() {
   }
   if (!need_spawn) return;
 
-  spawn_heater_controller(HEATER_CONTROLLER_PATH);
+  spawn_heater_controller(BIBBY_PATH);
   // Wait for the controller to create the shm segment (up to ~1 s).
   for (int i = 0; i < 100; i++) {
     int f = shm_open(SHM_NAME, O_RDWR, 0666);
@@ -360,38 +399,60 @@ static void draw_text(ImDrawList *dl, float x, float y, ImU32 col, const char *t
   dl->AddText(g_font, g_sz_body, ImVec2(x, y), col, txt);
 }
 
-// A large touch toggle that flips *v when tapped; green when on, grey when off.
-static void toggle_button(const char *label, bool *v, ImVec2 pos, ImVec2 size) {
+// A big touch toggle (not necessarily square): green when on, grey when off,
+// with a centered label that wraps onto a second line at a space to fit the box.
+static void toggle_button(ImDrawList *dl, const char *label, bool *v, ImVec2 pos, ImVec2 size) {
   ImGui::SetCursorPos(pos);
-  ImGui::PushStyleColor(ImGuiCol_Button,
-                        *v ? ImVec4(0.20f, 0.55f, 0.25f, 1) : ImVec4(0.24f, 0.24f, 0.28f, 1));
-  ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                        *v ? ImVec4(0.25f, 0.65f, 0.30f, 1) : ImVec4(0.32f, 0.32f, 0.36f, 1));
-  ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.30f, 0.70f, 0.35f, 1));
-  if (ImGui::Button(label, size)) *v = !*v;
-  ImGui::PopStyleColor(3);
+  if (ImGui::InvisibleButton(label, size)) *v = !*v;
+  const bool  hov = ImGui::IsItemHovered();
+  const ImU32 bg  = *v ? (hov ? IM_COL32(70, 175, 86, 255) : IM_COL32(50, 140, 66, 255))
+                       : (hov ? IM_COL32(80, 80, 92, 255)  : IM_COL32(58, 58, 68, 255));
+  const ImVec2 br    = ImVec2(pos.x + size.x, pos.y + size.y);
+  const float  round = (size.x < size.y ? size.x : size.y) * 0.12f;
+  dl->AddRectFilled(pos, br, bg, round);
+  dl->AddRect(pos, br, IM_COL32(20, 20, 24, 255), round, 0, 1.5f);
+
+  // Split the label onto two lines at the last space, sized to fit the box.
+  char l1[24], l2[24];
+  l1[0] = l2[0] = '\0';
+  const char *sp = nullptr;
+  for (const char *p = label; *p; p++) if (*p == ' ') sp = p;
+  if (sp) {
+    int n1 = (int)(sp - label);
+    if (n1 > (int)sizeof(l1) - 1) n1 = (int)sizeof(l1) - 1;
+    for (int i = 0; i < n1; i++) l1[i] = label[i];
+    l1[n1] = '\0';
+    snprintf(l2, sizeof(l2), "%s", sp + 1);
+  } else {
+    snprintf(l1, sizeof(l1), "%s", label);
+  }
+
+  const float cx      = pos.x + size.x * 0.5f;
+  const float cy      = pos.y + size.y * 0.5f;
+  const float target  = size.x * 0.86f;
+  const ImU32 col_txt = IM_COL32(245, 247, 250, 255);
+  float fs = fit_size(g_font, g_sz_body, target, l1);
+  if (l2[0]) {
+    float f2 = fit_size(g_font, g_sz_body, target, l2);
+    if (f2 < fs) fs = f2;
+    if (fs > size.y * 0.40f) fs = size.y * 0.40f;   // keep two lines inside the box
+    draw_centered(dl, g_font, fs, cx, cy - fs - 1.0f, col_txt, l1);
+    draw_centered(dl, g_font, fs, cx, cy + 1.0f,      col_txt, l2);
+  } else {
+    if (fs > size.y * 0.70f) fs = size.y * 0.70f;
+    draw_centered(dl, g_font, fs, cx, cy - fs * 0.5f, col_txt, l1);
+  }
 }
 
-// Set point stepper: a centered value over two rows of coarse/fine +/- buttons.
-static void draw_setpoint(ImDrawList *dl, ImVec2 pos, ImVec2 size, float *sp) {
-  char v[32];
-  snprintf(v, sizeof(v), "%.1f °C", *sp);
-  float fs = g_sz_med;
-  draw_centered(dl, g_font, fs, pos.x + size.x * 0.5f, pos.y, IM_COL32(130, 220, 140, 255), v);
-
-  const char *lab[2][3] = { { "-10", "-1", "-0.1" }, { "+0.1", "+1", "+10" } };
-  const float stp[2][3] = { { -10.0f, -1.0f, -0.1f }, { 0.1f, 1.0f, 10.0f } };
-
-  const float gap   = 6.0f;
-  const float val_h = fs * 1.2f;
-  const float bw    = (size.x - 2.0f * gap) / 3.0f;
-  const float bh    = (size.y - val_h - gap) / 2.0f;
-  const float by0   = pos.y + val_h;
+// Six set-point step buttons (+10 +1 +0.1 / -10 -1 -0.1) as a 2x3 grid of squares.
+static void draw_adjust_grid(ImVec2 pos, float cell, float gap, float *sp) {
+  const char *lab[2][3] = { { "+10", "+1", "+0.1" }, { "-10", "-1", "-0.1" } };
+  const float stp[2][3] = { { 10.0f, 1.0f, 0.1f }, { -10.0f, -1.0f, -0.1f } };
   for (int r = 0; r < 2; r++) {
-    for (int c = 0; c < 3; c++) {
-      ImGui::SetCursorPos(ImVec2(pos.x + c * (bw + gap), by0 + r * (bh + gap)));
-      if (ImGui::Button(lab[r][c], ImVec2(bw, bh))) {
-        *sp = clampf(*sp + stp[r][c], 0.0f, 105.0f);
+    for (int col = 0; col < 3; col++) {
+      ImGui::SetCursorPos(ImVec2(pos.x + col * (cell + gap), pos.y + r * (cell + gap)));
+      if (ImGui::Button(lab[r][col], ImVec2(cell, cell))) {
+        *sp = clampf(*sp + stp[r][col], 0.0f, 105.0f);
       }
     }
   }
@@ -399,9 +460,10 @@ static void draw_setpoint(ImDrawList *dl, ImVec2 pos, ImVec2 size, float *sp) {
 
 // ----------------------------------------------------------------------------
 // UI — one frame. Fixed grid: every element is placed at an absolute position,
-// so conditional content (alarms, faults) never reflows the layout. Right third
-// is the kettle; the left two-thirds stack set point, graph, toggles, sliders,
-// and a status band.
+// so conditional content (alarms, faults) never reflows the layout. The right
+// edge holds a short kettle (set point + temperatures over it) with a single
+// full-height duty slider to its left; the left side stacks the toggle/step
+// buttons over the temperature graph and a fault-status band.
 // ----------------------------------------------------------------------------
 static void draw_ui(int portrait_w, int portrait_h, const UiStatus &s,
                     const UiControls &c, const TempHistory &history, double now) {
@@ -420,103 +482,106 @@ static void draw_ui(int portrait_w, int portrait_h, const UiStatus &s,
                ImGuiWindowFlags_NoBringToFrontOnFocus);
   ImDrawList *dl = ImGui::GetWindowDrawList();
 
-  const float W       = (float)portrait_w;
-  const float H       = (float)portrait_h;
-  const float lineh   = ImGui::GetTextLineHeight();
-  const float right_w = W * 0.34f;
-  const float right_x = W - right_w;
+  const float W     = (float)portrait_w;
+  const float H     = (float)portrait_h;
+  const float lineh = ImGui::GetTextLineHeight();
+  const float mx    = W * 0.02f;
+  const float gap   = W * 0.012f;
 
-  // --- Right third: kettle with the temperature readout overlaid ---
-  draw_kettle(dl, ImVec2(right_x, 0), ImVec2(right_w, H), s.out1, s.out2, *c.grain_in);
+  const float right_w = W * 0.34f;            // kettle column width
+  const float right_x = W - right_w;          // kettle column left edge
+  const float sl_w    = W * 0.07f;            // single duty slider width
+  const float sl_gap  = W * 0.018f;
+  const float sl_x    = right_x - sl_gap - sl_w;
+
+  // --- Single duty slider: full height, just left of the kettle, drives both
+  // SSRs. Editable only in manual mode; in auto the PID owns duty1/duty2 and the
+  // disabled bar just displays the commanded value. ---
   {
-    char cbuf[24], fbuf[24];
-    snprintf(cbuf, sizeof(cbuf), "%.1f °C", s.temp_c);
-    snprintf(fbuf, sizeof(fbuf), "%.1f °F", s.temp_c * 9.0f / 5.0f + 32.0f);
-    // Fit to the kettle width using a fixed-width template, so the readout stays
-    // as large as possible without overflowing and does not jump as digits change.
-    const float tw   = right_w * 0.92f;
-    const float fs_c = fit_size(g_font, g_sz_large, tw, "188.8 °C");
-    const float fs_f = fit_size(g_font, g_sz_med, tw, "188.8 °F");
-    const float cxr  = right_x + right_w * 0.5f;
-    draw_centered(dl, g_font, fs_c, cxr, H * 0.12f, IM_COL32(255, 255, 255, 255), cbuf);
-    draw_centered(dl, g_font, fs_f, cxr, H * 0.12f + fs_c * 0.98f, IM_COL32(210, 215, 225, 255), fbuf);
+    const float sl_top = H * 0.06f;
+    const float sl_h   = H * 0.86f;
+    ImGui::BeginDisabled(!*c.manual_control);
+    ImGui::SetCursorPos(ImVec2(sl_x, sl_top));
+    ImGui::VSliderFloat("##duty", ImVec2(sl_w, sl_h), c.duty1, 0.0f, 1.0f, "");
+    ImGui::EndDisabled();
+    if (*c.manual_control) *c.duty2 = *c.duty1;   // one bar commands both SSRs
+
+    const float scx = sl_x + sl_w * 0.5f;
+    char pct[16];
+    snprintf(pct, sizeof(pct), "%.0f%%", *c.duty1 * 100.0f);
+    draw_centered(dl, g_font, g_sz_body, scx, sl_top - lineh - 2.0f, col_label, "SSR");
+    draw_centered(dl, g_font, g_sz_med,  scx, sl_top + sl_h + 4.0f,
+                  (s.out1 || s.out2) ? col_green : col_grey, pct);
   }
 
-  // --- Left two-thirds: stacked bands at fixed positions ---
-  const float mx   = W * 0.025f;
-  const float colx = mx;
-  const float colw = right_x - mx * 2.0f;
-  const float gap  = H * 0.012f;
-  float       y    = H * 0.015f;
-
-  // Set point
-  draw_text(dl, colx, y, col_label, "SET POINT");
-  y += lineh + 2.0f;
-  const float h_set = H * 0.20f;
-  draw_setpoint(dl, ImVec2(colx, y), ImVec2(colw, h_set), c.setpoint_c);
-  y += h_set + gap;
-
-  // Temperature graph
-  draw_text(dl, colx, y, col_label, "TEMPERATURE  (last 3 min)");
-  y += lineh + 2.0f;
-  const float h_graph = H * 0.20f;
-  history.draw_graph(dl, ImVec2(colx, y), ImVec2(colw, h_graph), now);
-  y += h_graph + gap;
-
-  // Toggles
-  const float h_tog = H * 0.075f;
-  toggle_button("Grain In", c.grain_in, ImVec2(colx, y), ImVec2(colw * 0.48f, h_tog));
-  toggle_button("Manual Control", c.manual_control,
-                ImVec2(colx + colw * 0.52f, y), ImVec2(colw * 0.48f, h_tog));
-  y += h_tog + gap;
-
-  // Duty sliders — editable only in manual mode. In auto the PID owns duty1/
-  // duty2 (set by the caller before this frame); the disabled sliders just
-  // display the commanded value.
-  const float h_slid = H * 0.22f;
-  const float sw     = colw * 0.30f;
-  const float sh     = h_slid - lineh * 2.0f - 6.0f;
-  const float s1x    = colx + colw * 0.10f;
-  const float s2x    = colx + colw * 0.58f;
-  ImGui::BeginDisabled(!*c.manual_control);
-  ImGui::SetCursorPos(ImVec2(s1x, y)); ImGui::VSliderFloat("##d1", ImVec2(sw, sh), c.duty1, 0.0f, 1.0f, "");
-  ImGui::SetCursorPos(ImVec2(s2x, y)); ImGui::VSliderFloat("##d2", ImVec2(sw, sh), c.duty2, 0.0f, 1.0f, "");
-  ImGui::EndDisabled();
+  // --- Kettle column: set point reading + temperatures over a short kettle ---
   {
-    char p1[16], p2[16];
-    snprintf(p1, sizeof(p1), "%.0f%%", *c.duty1 * 100.0f);
-    snprintf(p2, sizeof(p2), "%.0f%%", *c.duty2 * 100.0f);
-    draw_text(dl, s1x, y + sh + 4.0f, col_label, "SSR1");
-    draw_text(dl, s2x, y + sh + 4.0f, col_label, "SSR2");
-    draw_text(dl, s1x, y + sh + 4.0f + lineh, s.out1 ? col_green : col_grey, p1);
-    draw_text(dl, s2x, y + sh + 4.0f + lineh, s.out2 ? col_green : col_grey, p2);
+    char spbuf[24], cbuf[24], fbuf[24];
+    snprintf(spbuf, sizeof(spbuf), "Set Pt: %.1f°C", *c.setpoint_c);
+    snprintf(cbuf,  sizeof(cbuf),  "%.2f °C", s.temp_c);
+    snprintf(fbuf,  sizeof(fbuf),  "%.2f °F", s.temp_c * 9.0f / 5.0f + 32.0f);
+    // One size for the set point and both temperatures, fitted to the widest
+    // line so nothing overflows the column.
+    const float tw  = right_w * 0.96f;
+    const float fs  = fit_size(g_font, g_sz_large, tw, "Set Pt: 105.0°C");
+    const float cxr = right_x + right_w * 0.5f;
+
+    // Tall kettle: rim near the top (the set point sits above it), body bottom
+    // near the very bottom. draw_kettle puts the body bottom at 0.92 of region.
+    const float kettle_top = H * 0.03f;
+    const float kettle_h   = (H * 0.985f - kettle_top) / 0.92f;
+    const float body_top   = kettle_top + 0.10f * kettle_h;
+    const float lip_top    = body_top - kettle_h * 0.022f;
+
+    const float sp_y = lip_top - fs - H * 0.008f; // set point above the rim
+    const float c_y  = body_top + fs * 0.20f;     // temps overlaid inside the pot
+    const float f_y  = c_y + fs;
+    const float content_top = f_y + fs + H * 0.012f;
+
+    draw_kettle(dl, ImVec2(right_x, kettle_top), ImVec2(right_w, kettle_h),
+                s.bright1, s.bright2, *c.grain_in, content_top);
+    draw_centered(dl, g_font, fs, cxr, sp_y, IM_COL32(130, 220, 140, 255), spbuf);
+    draw_centered(dl, g_font, fs, cxr, c_y, IM_COL32(255, 255, 255, 255), cbuf);
+    draw_centered(dl, g_font, fs, cxr, f_y, IM_COL32(210, 215, 225, 255), fbuf);
   }
-  y += h_slid + gap;
 
-  // Status band — fixed slots; conditional text only changes color/contents.
-  const float sy = y;
+  // --- Left zone: small button cluster on top, large graph, alarms at bottom ---
+  const float lz_w = sl_x - sl_gap - mx;        // left zone width
+  const float y0   = H * 0.03f;
+
+  // Six set-point steppers as a 2x3 grid of squares (side a). To their left, the
+  // three toggles in two columns: Test Touch | Grain In on top, Manual Control
+  // across the bottom. Each toggle row is one stepper-square tall, so the cluster
+  // is two rows high overall.
+  const float a      = W * 0.105f;
+  const float band_h = 2.0f * a + gap;
+  const float tog_w  = lz_w - 3.0f * a - 3.0f * gap; // toggle area, left of steppers
+  const float tcw    = (tog_w - gap) * 0.5f;          // two toggle columns
+  toggle_button(dl, "Test Touch",     c.test_pressed,   ImVec2(mx, y0),             ImVec2(tcw, a));
+  toggle_button(dl, "Grain In",       c.grain_in,       ImVec2(mx + tcw + gap, y0), ImVec2(tcw, a));
+  toggle_button(dl, "Manual Control", c.manual_control, ImVec2(mx, y0 + a + gap),   ImVec2(tog_w, a));
+  draw_adjust_grid(ImVec2(mx + tog_w + gap, y0), a, gap, c.setpoint_c);
+
+  // Temperature graph fills everything between the buttons and the status line.
+  draw_text(dl, mx, y0 + band_h + gap, col_label, "TEMPERATURE  (last 3 min)");
+  const float fault_y = H - lineh - H * 0.012f; // lowest status line
+  const float g_y0    = y0 + band_h + gap + lineh + 2.0f;
+  history.draw_graph(dl, ImVec2(mx, g_y0), ImVec2(lz_w, fault_y - gap - g_y0), now);
+
+  // Fault status hugs the bottom: RTD fault (header + decode) on the lowest
+  // lines, watchdog above it. Drawn after the graph so it sits on top.
   {
-    char drdy[24];
-    snprintf(drdy, sizeof(drdy), "DRDYn: %s", s.drdy_high ? "HIGH" : "LOW");
-    draw_text(dl, colx, sy, col_label, drdy);
-    if (s.watchdog) draw_text(dl, colx, sy + lineh * 1.2f, col_red, "WATCHDOG ALARM");
     if (s.rtd_fault) {
       char rf[24];
       snprintf(rf, sizeof(rf), "RTD FAULT (0x%02X)", s.rtd_fault);
-      draw_text(dl, colx, sy + lineh * 2.4f, col_red, rf);
-      draw_text(dl, colx, sy + lineh * 3.6f, col_pink,
-                Max31865::decode_fault_status(s.rtd_fault).c_str());
+      draw_text(dl, mx, fault_y - lineh * 1.15f, col_red, rf);
+      draw_text(dl, mx, fault_y, col_pink, Max31865::decode_fault_status(s.rtd_fault).c_str());
+    }
+    if (s.watchdog) {
+      draw_text(dl, mx, s.rtd_fault ? fault_y - lineh * 2.30f : fault_y, col_red,
+                "WATCHDOG ALARM");
     }
   }
-
-  // Test Touch lives in the right half of the band. It is the last (and always
-  // submitted) widget, so the window never ends on a dangling SetCursorPos.
-  const float bw = colw * 0.46f;
-  const float bh = H * 0.06f;
-  const float bx = colx + colw - bw;
-  if (*c.test_pressed) draw_text(dl, bx, sy + bh + 6.0f, col_green, "WORKING!");
-  ImGui::SetCursorPos(ImVec2(bx, sy));
-  if (ImGui::Button("Test Touch", ImVec2(bw, bh))) *c.test_pressed = !*c.test_pressed;
 
   ImGui::End();
   ImGui::PopStyleVar();

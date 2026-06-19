@@ -13,10 +13,14 @@
 // kernel releases it automatically when the process exits for any reason,
 // including a crash or kill -9. No stale lock files to clean up.
 //
+// The fd is opened O_CLOEXEC so it is not inherited across exec(): otherwise a
+// child the locker spawns (e.g. the frontend launching the heater-controller)
+// would keep this lock held for its own lifetime, blocking later instances.
+//
 // Returns the lock fd (>= 0) if this is the only instance, or -1 if another
 // instance already holds the lock or the lock file could not be opened.
 static inline int single_instance_lock(const char *path) {
-  int fd = open(path, O_RDWR | O_CREAT, 0644);
+  int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
   if (fd < 0) {
     perror("single_instance: open");
     return -1;
