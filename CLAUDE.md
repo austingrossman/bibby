@@ -37,7 +37,7 @@ Two separate processes communicate via POSIX shared memory (`/biab_heater`).
 | `simulate_zc` | frontend | bool | fake ZC for testing |
 | `frontend_iteration` | frontend | uint32 | incremented each UI frame; heater-controller forces duties to zero if stale for ~2s (120 ZC cycles) |
 | `output1`, `output2` | heater-controller | bool | current SSR fired state |
-| `watchdog_alarm` | heater-controller | bool | no ZC within 9s |
+| `watchdog_alarm` | heater-controller | bool | no ZC within 9ms |
 | `iteration` | heater-controller | uint32 | ZC counter |
 
 ## Pin assignments (40-pin header)
@@ -61,6 +61,6 @@ Frontend links: SDL3-static, GLESv2, gpiod, rt.
 
 ## Safety
 A safe and robust system is important as this is dealing with high power and high voltage.
-The heater-controller needs to be up at all times. When it is exiting, crashes, or starts up, output to the SSR's shall be low. Don't worry about heater-controller starting up when the raspberry pi boots up, I will figure that out. When the frontend runs, and does not detect the heater-controller running, it will load up the heater-controller..
-If the heater-controller does not detect the frontend, running and servicing the shared memory, the outputs to the SSRs shall be low.
+The heater-controller needs to be up at all times. When it is exiting, crashes, or starts up, output to the SSR's shall be low and duty% commands be zero. Don't worry about heater-controller starting up when the raspberry pi boots up, I will figure that out. When the frontend runs, and does not detect the heater-controller running, it will load up the heater-controller..
+If the heater-controller does not detect the frontend, running and servicing the shared memory, the outputs to the SSRs shall be low (setting duty% to zero suffices for this requirement).
 When the frontend does not have reliable temperature, i.e. when a fault occurs, only manual control is allowed to drive the SSRs.

@@ -3,6 +3,8 @@
 #include <cfloat>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <gpiod.h>
 
@@ -16,12 +18,17 @@
 #include "../shared/single_instance.h"
 #include "sensors/max31865.h"
 #include "temp_filter.h"
+#include "pid.h"
 #include "display.h"
 #include "gui/kettle.h"
 #include "gui/temp_history.h"
 
 #ifndef FONT_DIR
   #define FONT_DIR "third_party/imgui/misc/fonts"
+#endif
+
+#ifndef HEATER_CONTROLLER_PATH
+  #define HEATER_CONTROLLER_PATH "heater-controller"
 #endif
 
 // MAX31865 DRDY input, GPIO 16 (header pin 36), active-low.
@@ -57,6 +64,7 @@ struct UiControls {
 };
 
 static HeaterShm          *shm_connect();
+static void                ensure_heater_controller();
 static gpiod_line_request *init_drdy_line(gpiod_chip *chip);
 static SDL_Window         *create_window(SDL_GLContext *out_ctx, int *out_w, int *out_h);
 static void                init_imgui(SDL_Window *window, SDL_GLContext ctx, int portrait_h);
@@ -71,6 +79,9 @@ int main(void) {
     fprintf(stderr, "frontend: another instance is already running\n");
     return 1;
   }
+
+  // The heater-controller must be up before we attach to its shared memory.
+  ensure_heater_controller();
 
   SDL_GLContext gl_ctx;
   int display_w, display_h;
@@ -87,9 +98,11 @@ int main(void) {
   Max31865 sensor("/dev/spidev0.0", 400, drdy_req);
   SecondOrderAverage temp_filter(TEMP_FILTER_WINDOW);
   TempHistory temp_history;
+  PidController pid;
 
   ImGuiIO &io = ImGui::GetIO();
   float duty1 = 0.0f, duty2 = 0.0f;
+  float pid_duty = 0.0f;  // latest PID power command; held between fresh samples
   float temp_c = 0.0f;
   bool  test_pressed   = false;
   float setpoint_c     = 65.0f;
@@ -121,8 +134,22 @@ int main(void) {
     bool  temp_fresh = false;
     float temp_raw   = sensor.read_temperature(&temp_fresh);
     if (temp_fresh) {
-      temp_c = temp_filter.push(temp_raw);
+      temp_c   = temp_filter.push(temp_raw);
       temp_history.push(temp_c, now);
+      pid_duty = pid.update(temp_c, setpoint_c);  // run the controller on each new sample
+    }
+
+    // --- Control mode ---
+    uint8_t rtd_fault     = sensor.fault_status();
+    bool    temp_reliable = (rtd_fault == 0);
+    // Safety (CLAUDE.md): with unreliable temperature only manual control may
+    // drive the SSRs. Force manual so the PID path cannot command power.
+    if (!temp_reliable) manual_control = true;
+    // In auto, the PID drives both SSRs (currently zero). In manual, the sliders
+    // do, set inside draw_ui below.
+    if (!manual_control) {
+      duty1 = pid_duty;
+      duty2 = pid_duty;
     }
 
     // --- Controller status from shared memory ---
@@ -132,7 +159,7 @@ int main(void) {
     status.out2      = shm->output2;
     status.watchdog  = shm->watchdog_alarm;
     status.drdy_high = gpiod_line_request_get_value(drdy_req, DRDY_GPIO) == GPIOD_LINE_VALUE_ACTIVE;
-    status.rtd_fault = sensor.fault_status();
+    status.rtd_fault = rtd_fault;
 
     // --- Render the UI into the portrait FBO ---
     display.begin_frame();
@@ -185,6 +212,64 @@ static HeaterShm *shm_connect() {
     exit(1);
   }
   return (HeaterShm *)p;
+}
+
+static void sleep_ms(long ms) {
+  struct timespec ts;
+  ts.tv_sec  = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000L;
+  nanosleep(&ts, nullptr);
+}
+
+// Launch the heater-controller detached, so it outlives the frontend (the
+// controller must stay up at all times). Double-fork + setsid reparents it to
+// init and avoids leaving a zombie here. A launch when one is already running
+// is harmless: it fails the single-instance lock and exits immediately.
+static void spawn_heater_controller(const char *exe_path) {
+  pid_t pid = fork();
+  if (pid < 0) { perror("fork"); return; }
+  if (pid == 0) {
+    setsid();
+    pid_t pid2 = fork();
+    if (pid2 < 0) _exit(127);
+    if (pid2 > 0) _exit(0);
+    execl(exe_path, exe_path, (char *)nullptr);
+    perror("execl heater-controller");
+    _exit(127);
+  }
+  waitpid(pid, nullptr, 0);  // reap the short-lived intermediate child
+}
+
+// ----------------------------------------------------------------------------
+// Make sure the heater-controller is running before we attach to its shm.
+// Detection uses the shm `iteration` counter: if the segment is missing, or the
+// counter does not advance over a short window, the controller is not servicing
+// it and we (re)launch it, then wait for the segment to appear.
+// ----------------------------------------------------------------------------
+static void ensure_heater_controller() {
+  bool need_spawn = true;
+  int  fd = shm_open(SHM_NAME, O_RDWR, 0666);
+  if (fd >= 0) {
+    HeaterShm *probe = (HeaterShm *)mmap(NULL, sizeof(HeaterShm),
+                                         PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (probe != MAP_FAILED) {
+      uint32_t before = probe->iteration;
+      sleep_ms(150);  // ~9 mains cycles at 60 Hz; long enough to see ZC advance
+      need_spawn = (probe->iteration == before);
+      munmap(probe, sizeof(HeaterShm));
+    }
+  }
+  if (!need_spawn) return;
+
+  spawn_heater_controller(HEATER_CONTROLLER_PATH);
+  // Wait for the controller to create the shm segment (up to ~1 s).
+  for (int i = 0; i < 100; i++) {
+    int f = shm_open(SHM_NAME, O_RDWR, 0666);
+    if (f >= 0) { close(f); return; }
+    sleep_ms(10);
+  }
+  fprintf(stderr, "frontend: heater-controller shm did not appear after spawn\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -385,8 +470,9 @@ static void draw_ui(int portrait_w, int portrait_h, const UiStatus &s,
                 ImVec2(colx + colw * 0.52f, y), ImVec2(colw * 0.48f, h_tog));
   y += h_tog + gap;
 
-  // Duty sliders — editable only in manual mode; zeroed otherwise (PID TBD).
-  if (!*c.manual_control) { *c.duty1 = 0.0f; *c.duty2 = 0.0f; }
+  // Duty sliders — editable only in manual mode. In auto the PID owns duty1/
+  // duty2 (set by the caller before this frame); the disabled sliders just
+  // display the commanded value.
   const float h_slid = H * 0.22f;
   const float sw     = colw * 0.30f;
   const float sh     = h_slid - lineh * 2.0f - 6.0f;

@@ -62,6 +62,12 @@ int main(void) {
   }
 
   HeaterShm *shm = shm_open_map();
+  // The shm segment persists across restarts (never unlinked), so duty1/duty2
+  // may hold stale non-zero values from a previous run. Force them to zero at
+  // startup so a restart with no frontend running does not immediately fire the
+  // SSRs at the old duty cycle (Safety: outputs low on startup).
+  atomic_store(&shm->duty1, 0.0f);
+  atomic_store(&shm->duty2, 0.0f);
   atomic_store(&shm->output1, false);
   atomic_store(&shm->output2, false);
   atomic_store(&shm->watchdog_alarm, false);

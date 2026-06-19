@@ -27,6 +27,7 @@ add_executable(frontend
     main.cpp
     display.cpp
     temp_filter.cpp
+    pid.cpp
     sensors/max31865.cpp
     gui/kettle.cpp
     gui/temp_history.cpp
@@ -42,9 +43,19 @@ target_include_directories(frontend PRIVATE
 
 # GLES3 on Pi — no desktop OpenGL needed.
 # FONT_DIR lets the frontend load the vendored TTFs regardless of the runtime cwd.
+#
+# HEATER_CONTROLLER_PATH is the absolute build-tree path of the sibling binary so
+# the frontend always launches the freshly built controller during development.
+#
+# TODO(install): this path is NOT relocatable — after `make install` it still
+# points into the build tree, which may not exist on the target. Before adding
+# any install() rule, switch this to runtime resolution (resolve /proc/self/exe,
+# look for the sibling, fall back to a PATH search) or to
+# ${CMAKE_INSTALL_FULL_BINDIR}. See memory: install-relocatable-heater-path.
 target_compile_definitions(frontend PRIVATE
     IMGUI_IMPL_OPENGL_ES3
     FONT_DIR="${IMGUI_DIR}/misc/fonts"
+    HEATER_CONTROLLER_PATH="$<TARGET_FILE:heater-controller>"
 )
 
 find_library(GLESV2_LIB GLESv2 REQUIRED)
