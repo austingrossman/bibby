@@ -1,4 +1,6 @@
+#include <cstdio>
 #include <cstdlib>
+#include <cfloat>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -15,12 +17,26 @@
 #include "sensors/max31865.h"
 #include "temp_filter.h"
 #include "display.h"
+#include "gui/kettle.h"
+#include "gui/temp_history.h"
+
+#ifndef FONT_DIR
+  #define FONT_DIR "third_party/imgui/misc/fonts"
+#endif
 
 // MAX31865 DRDY input, GPIO 16 (header pin 36), active-low.
 static constexpr unsigned int DRDY_GPIO = 16;
 
 // Samples per stage in the temperature smoothing filter.
 static constexpr int TEMP_FILTER_WINDOW = 40;
+
+// One scalable font (ImGui 1.92 bakes any size on demand); the body size is the
+// default for widgets, med/large are passed explicitly to AddText. Sized from
+// the panel height in init_imgui so the layout scales across displays.
+static ImFont *g_font     = nullptr;
+static float   g_sz_body  = 24.0f;
+static float   g_sz_med   = 36.0f;
+static float   g_sz_large = 88.0f;
 
 // Live status snapshot handed to the UI each frame.
 struct UiStatus {
@@ -31,12 +47,21 @@ struct UiStatus {
   uint8_t rtd_fault; // MAX31865 Fault Status register (07h); 0 = no fault
 };
 
+// Everything the UI may edit; the caller publishes these after draw_ui returns.
+struct UiControls {
+  float *duty1, *duty2;
+  bool  *test_pressed;
+  float *setpoint_c;
+  bool  *manual_control;
+  bool  *grain_in;
+};
+
 static HeaterShm          *shm_connect();
 static gpiod_line_request *init_drdy_line(gpiod_chip *chip);
 static SDL_Window         *create_window(SDL_GLContext *out_ctx, int *out_w, int *out_h);
-static void                init_imgui(SDL_Window *window, SDL_GLContext ctx);
+static void                init_imgui(SDL_Window *window, SDL_GLContext ctx, int portrait_h);
 static void                draw_ui(int portrait_w, int portrait_h, const UiStatus &s,
-                                   float *duty1, float *duty2, bool *test_pressed);
+                                   const UiControls &c, const TempHistory &history, double now);
 
 // ----------------------------------------------------------------------------
 int main(void) {
@@ -52,7 +77,7 @@ int main(void) {
   SDL_Window *window = create_window(&gl_ctx, &display_w, &display_h);
 
   RotatedDisplay display(display_w, display_h);
-  init_imgui(window, gl_ctx);
+  init_imgui(window, gl_ctx, display.portrait_h());
 
   HeaterShm *shm = shm_connect();
 
@@ -61,14 +86,20 @@ int main(void) {
 
   Max31865 sensor("/dev/spidev0.0", 400, drdy_req);
   SecondOrderAverage temp_filter(TEMP_FILTER_WINDOW);
+  TempHistory temp_history;
 
   ImGuiIO &io = ImGui::GetIO();
   float duty1 = 0.0f, duty2 = 0.0f;
   float temp_c = 0.0f;
-  bool  test_pressed = false;
-  bool  running = true;
+  bool  test_pressed   = false;
+  float setpoint_c     = 65.0f;
+  bool  manual_control = true;  // matches prior behavior: sliders drive the SSRs
+  bool  grain_in       = false;
+  bool  running        = true;
 
   while (running) {
+    double now = SDL_GetTicks() / 1000.0;
+
     // --- Input: route touches through the portrait→landscape rotation ---
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -89,7 +120,10 @@ int main(void) {
     // --- Sensor: smooth fresh readings, hold the last value otherwise ---
     bool  temp_fresh = false;
     float temp_raw   = sensor.read_temperature(&temp_fresh);
-    if (temp_fresh) temp_c = temp_filter.push(temp_raw);
+    if (temp_fresh) {
+      temp_c = temp_filter.push(temp_raw);
+      temp_history.push(temp_c, now);
+    }
 
     // --- Controller status from shared memory ---
     UiStatus status;
@@ -108,7 +142,8 @@ int main(void) {
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 
     ImGui::NewFrame();
-    draw_ui(display.portrait_w(), display.portrait_h(), status, &duty1, &duty2, &test_pressed);
+    UiControls ctl{ &duty1, &duty2, &test_pressed, &setpoint_c, &manual_control, &grain_in };
+    draw_ui(display.portrait_w(), display.portrait_h(), status, ctl, temp_history, now);
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -194,80 +229,209 @@ static SDL_Window *create_window(SDL_GLContext *out_ctx, int *out_w, int *out_h)
   return window;
 }
 
-static void init_imgui(SDL_Window *window, SDL_GLContext ctx) {
+static void init_imgui(SDL_Window *window, SDL_GLContext ctx, int portrait_h) {
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
   ImGui::StyleColorsDark();
 
-  ImFontConfig fc;
-  fc.SizePixels = 26.0f;
-  ImGui::GetIO().Fonts->AddFontDefault(&fc);
+  g_sz_body  = portrait_h * 0.030f;
+  g_sz_med   = portrait_h * 0.045f;
+  g_sz_large = portrait_h * 0.110f;
+
+  ImFontAtlas *fonts = ImGui::GetIO().Fonts;
+  g_font = fonts->AddFontFromFileTTF(FONT_DIR "/Roboto-Medium.ttf", g_sz_body);
+  if (!g_font) g_font = fonts->AddFontDefault(); // fallback if the TTF is missing
+  ImGui::GetStyle().FontSizeBase = g_sz_body;    // default widget text size
 
   ImGui_ImplSDL3_InitForOpenGL(window, ctx);
   ImGui_ImplOpenGL3_Init("#version 300 es");
 }
 
 // ----------------------------------------------------------------------------
-// UI — one frame of the control panel. Reads live status, edits the duty/test
-// values in place; the caller publishes those to shared memory.
+// UI helpers
+// ----------------------------------------------------------------------------
+static float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// Draw text horizontally centered on cx, in a specific font/size.
+static void draw_centered(ImDrawList *dl, ImFont *font, float fs, float cx, float y,
+                          ImU32 col, const char *txt) {
+  ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, txt);
+  dl->AddText(font, fs, ImVec2(cx - sz.x * 0.5f, y), col, txt);
+}
+
+// Largest size <= max_size at which `txt` fits within target_w (px).
+static float fit_size(ImFont *font, float max_size, float target_w, const char *txt) {
+  ImVec2 sz = font->CalcTextSizeA(max_size, FLT_MAX, 0.0f, txt);
+  return (sz.x <= target_w || sz.x <= 0.0f) ? max_size : max_size * target_w / sz.x;
+}
+
+// Left-aligned body text at an absolute position, via the draw list. Used for
+// all labels/status so SetCursorPos is reserved for interactive widgets only
+// (a SetCursorPos not followed by an item trips an ImGui boundary assert).
+static void draw_text(ImDrawList *dl, float x, float y, ImU32 col, const char *txt) {
+  dl->AddText(g_font, g_sz_body, ImVec2(x, y), col, txt);
+}
+
+// A large touch toggle that flips *v when tapped; green when on, grey when off.
+static void toggle_button(const char *label, bool *v, ImVec2 pos, ImVec2 size) {
+  ImGui::SetCursorPos(pos);
+  ImGui::PushStyleColor(ImGuiCol_Button,
+                        *v ? ImVec4(0.20f, 0.55f, 0.25f, 1) : ImVec4(0.24f, 0.24f, 0.28f, 1));
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                        *v ? ImVec4(0.25f, 0.65f, 0.30f, 1) : ImVec4(0.32f, 0.32f, 0.36f, 1));
+  ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.30f, 0.70f, 0.35f, 1));
+  if (ImGui::Button(label, size)) *v = !*v;
+  ImGui::PopStyleColor(3);
+}
+
+// Set point stepper: a centered value over two rows of coarse/fine +/- buttons.
+static void draw_setpoint(ImDrawList *dl, ImVec2 pos, ImVec2 size, float *sp) {
+  char v[32];
+  snprintf(v, sizeof(v), "%.1f °C", *sp);
+  float fs = g_sz_med;
+  draw_centered(dl, g_font, fs, pos.x + size.x * 0.5f, pos.y, IM_COL32(130, 220, 140, 255), v);
+
+  const char *lab[2][3] = { { "-10", "-1", "-0.1" }, { "+0.1", "+1", "+10" } };
+  const float stp[2][3] = { { -10.0f, -1.0f, -0.1f }, { 0.1f, 1.0f, 10.0f } };
+
+  const float gap   = 6.0f;
+  const float val_h = fs * 1.2f;
+  const float bw    = (size.x - 2.0f * gap) / 3.0f;
+  const float bh    = (size.y - val_h - gap) / 2.0f;
+  const float by0   = pos.y + val_h;
+  for (int r = 0; r < 2; r++) {
+    for (int c = 0; c < 3; c++) {
+      ImGui::SetCursorPos(ImVec2(pos.x + c * (bw + gap), by0 + r * (bh + gap)));
+      if (ImGui::Button(lab[r][c], ImVec2(bw, bh))) {
+        *sp = clampf(*sp + stp[r][c], 0.0f, 105.0f);
+      }
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+// UI — one frame. Fixed grid: every element is placed at an absolute position,
+// so conditional content (alarms, faults) never reflows the layout. Right third
+// is the kettle; the left two-thirds stack set point, graph, toggles, sliders,
+// and a status band.
 // ----------------------------------------------------------------------------
 static void draw_ui(int portrait_w, int portrait_h, const UiStatus &s,
-                    float *duty1, float *duty2, bool *test_pressed) {
-  const float slider_area_w = (float)portrait_w * 0.4f;
-  const float slider_w      = slider_area_w * 0.47f;
-  const float content_w     = (float)portrait_w - slider_area_w;
-  const float inner_h       = (float)portrait_h - 20.0f;
+                    const UiControls &c, const TempHistory &history, double now) {
+  const ImU32 col_label = IM_COL32(180, 186, 196, 255);
+  const ImU32 col_red   = IM_COL32(255, 60, 60, 255);
+  const ImU32 col_pink  = IM_COL32(255, 140, 140, 255);
+  const ImU32 col_green = IM_COL32(80, 230, 90, 255);
+  const ImU32 col_grey  = IM_COL32(150, 150, 150, 255);
 
-  ImGui::SetNextWindowPos({0, 0});
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+  ImGui::SetNextWindowPos({ 0, 0 });
   ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-  ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove);
+  ImGui::Begin("##main", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+               ImGuiWindowFlags_NoBringToFrontOnFocus);
+  ImDrawList *dl = ImGui::GetWindowDrawList();
 
-  // --- Left column: status readout and the test toggle ---
-  ImGui::BeginChild("##left", ImVec2(content_w, inner_h));
+  const float W       = (float)portrait_w;
+  const float H       = (float)portrait_h;
+  const float lineh   = ImGui::GetTextLineHeight();
+  const float right_w = W * 0.34f;
+  const float right_x = W - right_w;
 
-  ImGui::Text("Temperature: %.2f °C", s.temp_c);
-  ImGui::Separator();
-  ImGui::Text("SSR 1: %s  (%.0f%%)", s.out1 ? "ON" : "off", *duty1 * 100.0f);
-  ImGui::Text("SSR 2: %s  (%.0f%%)", s.out2 ? "ON" : "off", *duty2 * 100.0f);
-  ImGui::Text("DRDYn: %s", s.drdy_high ? "HIGH" : "LOW");
-
-  if (s.watchdog) {
-    ImGui::TextColored({1.0f, 0.2f, 0.2f, 1.0f}, "WATCHDOG ALARM");
+  // --- Right third: kettle with the temperature readout overlaid ---
+  draw_kettle(dl, ImVec2(right_x, 0), ImVec2(right_w, H), s.out1, s.out2, *c.grain_in);
+  {
+    char cbuf[24], fbuf[24];
+    snprintf(cbuf, sizeof(cbuf), "%.1f °C", s.temp_c);
+    snprintf(fbuf, sizeof(fbuf), "%.1f °F", s.temp_c * 9.0f / 5.0f + 32.0f);
+    // Fit to the kettle width using a fixed-width template, so the readout stays
+    // as large as possible without overflowing and does not jump as digits change.
+    const float tw   = right_w * 0.92f;
+    const float fs_c = fit_size(g_font, g_sz_large, tw, "188.8 °C");
+    const float fs_f = fit_size(g_font, g_sz_med, tw, "188.8 °F");
+    const float cxr  = right_x + right_w * 0.5f;
+    draw_centered(dl, g_font, fs_c, cxr, H * 0.12f, IM_COL32(255, 255, 255, 255), cbuf);
+    draw_centered(dl, g_font, fs_f, cxr, H * 0.12f + fs_c * 0.98f, IM_COL32(210, 215, 225, 255), fbuf);
   }
 
-  if (s.rtd_fault) {
-    ImGui::TextColored({1.0f, 0.2f, 0.2f, 1.0f}, "RTD FAULT (0x%02X)", s.rtd_fault);
-    ImGui::TextColored({1.0f, 0.5f, 0.5f, 1.0f}, "%s",
-                       Max31865::decode_fault_status(s.rtd_fault).c_str());
+  // --- Left two-thirds: stacked bands at fixed positions ---
+  const float mx   = W * 0.025f;
+  const float colx = mx;
+  const float colw = right_x - mx * 2.0f;
+  const float gap  = H * 0.012f;
+  float       y    = H * 0.015f;
+
+  // Set point
+  draw_text(dl, colx, y, col_label, "SET POINT");
+  y += lineh + 2.0f;
+  const float h_set = H * 0.20f;
+  draw_setpoint(dl, ImVec2(colx, y), ImVec2(colw, h_set), c.setpoint_c);
+  y += h_set + gap;
+
+  // Temperature graph
+  draw_text(dl, colx, y, col_label, "TEMPERATURE  (last 3 min)");
+  y += lineh + 2.0f;
+  const float h_graph = H * 0.20f;
+  history.draw_graph(dl, ImVec2(colx, y), ImVec2(colw, h_graph), now);
+  y += h_graph + gap;
+
+  // Toggles
+  const float h_tog = H * 0.075f;
+  toggle_button("Grain In", c.grain_in, ImVec2(colx, y), ImVec2(colw * 0.48f, h_tog));
+  toggle_button("Manual Control", c.manual_control,
+                ImVec2(colx + colw * 0.52f, y), ImVec2(colw * 0.48f, h_tog));
+  y += h_tog + gap;
+
+  // Duty sliders — editable only in manual mode; zeroed otherwise (PID TBD).
+  if (!*c.manual_control) { *c.duty1 = 0.0f; *c.duty2 = 0.0f; }
+  const float h_slid = H * 0.22f;
+  const float sw     = colw * 0.30f;
+  const float sh     = h_slid - lineh * 2.0f - 6.0f;
+  const float s1x    = colx + colw * 0.10f;
+  const float s2x    = colx + colw * 0.58f;
+  ImGui::BeginDisabled(!*c.manual_control);
+  ImGui::SetCursorPos(ImVec2(s1x, y)); ImGui::VSliderFloat("##d1", ImVec2(sw, sh), c.duty1, 0.0f, 1.0f, "");
+  ImGui::SetCursorPos(ImVec2(s2x, y)); ImGui::VSliderFloat("##d2", ImVec2(sw, sh), c.duty2, 0.0f, 1.0f, "");
+  ImGui::EndDisabled();
+  {
+    char p1[16], p2[16];
+    snprintf(p1, sizeof(p1), "%.0f%%", *c.duty1 * 100.0f);
+    snprintf(p2, sizeof(p2), "%.0f%%", *c.duty2 * 100.0f);
+    draw_text(dl, s1x, y + sh + 4.0f, col_label, "SSR1");
+    draw_text(dl, s2x, y + sh + 4.0f, col_label, "SSR2");
+    draw_text(dl, s1x, y + sh + 4.0f + lineh, s.out1 ? col_green : col_grey, p1);
+    draw_text(dl, s2x, y + sh + 4.0f + lineh, s.out2 ? col_green : col_grey, p2);
+  }
+  y += h_slid + gap;
+
+  // Status band — fixed slots; conditional text only changes color/contents.
+  const float sy = y;
+  {
+    char drdy[24];
+    snprintf(drdy, sizeof(drdy), "DRDYn: %s", s.drdy_high ? "HIGH" : "LOW");
+    draw_text(dl, colx, sy, col_label, drdy);
+    if (s.watchdog) draw_text(dl, colx, sy + lineh * 1.2f, col_red, "WATCHDOG ALARM");
+    if (s.rtd_fault) {
+      char rf[24];
+      snprintf(rf, sizeof(rf), "RTD FAULT (0x%02X)", s.rtd_fault);
+      draw_text(dl, colx, sy + lineh * 2.4f, col_red, rf);
+      draw_text(dl, colx, sy + lineh * 3.6f, col_pink,
+                Max31865::decode_fault_status(s.rtd_fault).c_str());
+    }
   }
 
-  ImGui::Separator();
-  if (ImGui::Button("Test Touch", ImVec2(200, 60))) {
-    *test_pressed = !*test_pressed;
-  }
-  if (*test_pressed) {
-    ImGui::SameLine();
-    ImGui::TextColored({0.2f, 1.0f, 0.2f, 1.0f}, "WORKING!");
-  }
+  // Test Touch lives in the right half of the band. It is the last (and always
+  // submitted) widget, so the window never ends on a dangling SetCursorPos.
+  const float bw = colw * 0.46f;
+  const float bh = H * 0.06f;
+  const float bx = colx + colw - bw;
+  if (*c.test_pressed) draw_text(dl, bx, sy + bh + 6.0f, col_green, "WORKING!");
+  ImGui::SetCursorPos(ImVec2(bx, sy));
+  if (ImGui::Button("Test Touch", ImVec2(bw, bh))) *c.test_pressed = !*c.test_pressed;
 
-  ImGui::EndChild();
-
-  // --- Right column: vertical duty-cycle sliders ---
-  ImGui::SameLine();
-  ImGui::BeginChild("##sliders", ImVec2(slider_area_w, inner_h));
-
-  const float slider_h = inner_h - ImGui::GetTextLineHeightWithSpacing() - 8.0f;
-  ImGui::VSliderFloat("##ssr1", ImVec2(slider_w, slider_h), duty1, 0.0f, 1.0f, "");
-  ImGui::SameLine(0.0f, slider_area_w - slider_w * 2.0f);
-  ImGui::VSliderFloat("##ssr2", ImVec2(slider_w, slider_h), duty2, 0.0f, 1.0f, "");
-
-  // Labels centred under each slider.
-  ImGui::SetCursorPosX(ImGui::GetCursorPosX() - slider_area_w + slider_w * 0.3f);
-  ImGui::Text("SSR 1");
-  ImGui::SameLine(slider_w + (slider_area_w - slider_w * 2.0f) + slider_w * 0.3f);
-  ImGui::Text("SSR 2");
-
-  ImGui::EndChild();
   ImGui::End();
+  ImGui::PopStyleVar();
 }

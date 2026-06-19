@@ -21,6 +21,7 @@ Two separate processes communicate via POSIX shared memory (`/biab_heater`).
 - Touch input X/Y coordinates are remapped to match the rotation before being fed to ImGui
 - UI: temperature readout, SSR1/SSR2 on/off state + duty%, DRDY pin state, watchdog alarm, "Test Touch" button (toggles simulate_zc), two vertical duty cycle sliders
 - duty1/duty2 written to shm each frame; output1/output2/watchdog_alarm read from shm each frame
+- Implements a PID controller on the temperature to control the duty cycle of the SSRs.
 
 ## MAX31865 Sensor — `frontend/sensors/max31865.{h,cpp}`
 - PT100, 3-wire, 400Ω reference resistor
@@ -57,3 +58,9 @@ Two separate processes communicate via POSIX shared memory (`/biab_heater`).
 CMake. SDL3 via FetchContent. ImGui vendored in `third_party/imgui`.
 Frontend links: SDL3-static, GLESv2, gpiod, rt.
 `build/` is gitignored.
+
+## Safety
+A safe and robust system is important as this is dealing with high power and high voltage.
+The heater-controller needs to be up at all times. When it is exiting, crashes, or starts up, output to the SSR's shall be low. Don't worry about heater-controller starting up when the raspberry pi boots up, I will figure that out. When the frontend runs, and does not detect the heater-controller running, it will load up the heater-controller..
+If the heater-controller does not detect the frontend, running and servicing the shared memory, the outputs to the SSRs shall be low.
+When the frontend does not have reliable temperature, i.e. when a fault occurs, only manual control is allowed to drive the SSRs.

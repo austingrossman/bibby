@@ -28,17 +28,24 @@ add_executable(frontend
     display.cpp
     temp_filter.cpp
     sensors/max31865.cpp
+    gui/kettle.cpp
+    gui/temp_history.cpp
     ${IMGUI_SOURCES}
 )
 
 target_include_directories(frontend PRIVATE
     ${CMAKE_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
 )
 
-# GLES3 on Pi — no desktop OpenGL needed
-target_compile_definitions(frontend PRIVATE IMGUI_IMPL_OPENGL_ES3)
+# GLES3 on Pi — no desktop OpenGL needed.
+# FONT_DIR lets the frontend load the vendored TTFs regardless of the runtime cwd.
+target_compile_definitions(frontend PRIVATE
+    IMGUI_IMPL_OPENGL_ES3
+    FONT_DIR="${IMGUI_DIR}/misc/fonts"
+)
 
 find_library(GLESV2_LIB GLESv2 REQUIRED)
 find_library(GPIOD_LIB gpiod REQUIRED)
