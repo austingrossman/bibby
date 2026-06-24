@@ -176,12 +176,14 @@ ramping from zero.
 
 #### PID controller — `frontend/pid.{h,cpp}`
 
-`PidController::update(temp_c, setpoint_c)` runs once per fresh sample and returns
-a power command in `[0, 1]`. The full scaffolding is in place — per-sample
-execution, output clamp to `[0,1]`, integrator with anti-windup bound, and
-`reset()` — but the gains come from `bibby.ini` (§7) and **default to zero**, so
-auto mode commands zero power until the loop is tuned (see §9.3). `terms()` exposes the
-P/I/D breakdown and internal state for logging and tuning.
+`PidController::update(temp_c, setpoint_c, feedforward)` runs once per fresh
+sample and returns a power command `clamp(feedforward + p + i + d)` in `[0, 1]`.
+The full scaffolding is in place — per-sample execution, output clamp to
+`[0,1]`, conditional-integration anti-windup, and `reset()` — but the gains come
+from `bibby.ini` (§7) and **default to zero**, so the feedback commands zero
+power until the loop is tuned (see §9.5). The optional `feedforward` argument is
+the holding duty (§9.6); it defaults to zero. `terms()` exposes the
+feedforward / P / I / D breakdown and internal state for logging and tuning.
 
 > Note: the loop currently treats one sample as one time step (`dt` folded into
 > the gains). If the sample cadence changes, make `dt` explicit.
@@ -338,13 +340,14 @@ Tested target: **Raspberry Pi 5**, 64-bit Raspberry Pi OS.
 
 ### 5.1 OS and interfaces
 
-1. Flash Raspberry Pi OS (64-bit) and boot the Pi.
+1. Flash Raspberry Pi OS (64-bit) and boot the Pi. Install a beefy SD card (or other) for logging. Find a way to remote login to the pi.
 2. Enable SPI:
    ```
    sudo raspi-config   # Interface Options -> SPI -> Enable
    ```
    Confirm `/dev/spidev0.0` exists after reboot.
-3. The Pi 5 exposes GPIO via `/dev/gpiochip4`; both programs open it directly.
+   
+   The Pi 5 exposes GPIO via `/dev/gpiochip4`; both programs open it directly.
    The user running the binaries must have access to the GPIO and SPI devices
    (the `gpio` and `spi` groups, or run via a systemd unit with the right
    permissions).
@@ -366,7 +369,57 @@ sudo apt install -y build-essential cmake git \
   (e.g. `libinput`, `libudev`, X/Wayland or KMS/DRM headers) depending on how
   you run the display; install what SDL's configure step reports as missing.
 
-### 5.3 Get the source
+### 5.3 Autostart at boot (systemd)
+
+The frontend is the only process that needs to be started — it auto-launches
+the heater-controller if it is not already running. Create a systemd service
+to bring up the frontend on boot.
+
+Create `/etc/systemd/system/bibby.service`:
+
+```ini
+[Unit]
+Description=bibby brew controller frontend
+After=multi-user.target
+
+[Service]
+User=ramp
+SupplementaryGroups=gpio spi video render input
+Environment=BIBBY_CONFIG=/home/ramp/bibby/bibby.ini
+ExecStart=/home/ramp/bibby/build/frontend/frontend
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Adjust `User` and `ExecStart` to match your username and the actual path to
+the built binary (see §6). Enable and start it:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable bibby
+sudo systemctl start bibby
+```
+
+Check status and logs with:
+
+```
+systemctl status bibby
+journalctl -u bibby -f
+```
+
+The heater-controller inherits the service's group membership, so it also
+has the GPIO access it needs. If either process is killed, the heater-controller
+always drives the SSRs low before exiting; the frontend's watchdog in shared
+memory likewise forces duty to zero if the frontend stops updating.
+
+---
+
+## 6. Building bibby
+
+Clone the repository first:
 
 ```
 git clone --recurse-submodules <repo-url> bibby
@@ -376,10 +429,6 @@ git submodule update --init --recursive
 ```
 
 Dear ImGui is vendored as the `third_party/imgui` submodule.
-
----
-
-## 6. Building bibby
 
 Standard CMake out-of-source build:
 
@@ -429,6 +478,10 @@ kp = 0.0
 ki = 0.0
 kd = 0.0
 
+[feedforward]            ; holding-duty feedforward (§9.6); 0 gain = disabled
+process_gain_c = 0.0     ; identified process gain K, °C per unit duty (§9.4)
+ambient_c      = 20.0    ; cold-start / room reference temperature, °C
+
 [sensor]                 ; per-unit RTD calibration (re-derive per probe, §9)
 ref_resistor_ohms = 397.82   ; MAX31865 Rref, ice-point trimmed (§9.1)
 temp_cal_gain     = 1.0528   ; two-point span gain  (§9.2)
@@ -451,7 +504,8 @@ What each parameter drives:
 | Key | Used by | Effect |
 |---|---|---|
 | `mains.frequency_hz` | both | heater-controller: zero-cross watchdog timeout = mains half-period + 0.7 ms guard (60 Hz → 9.0 ms, 50 Hz → 10.7 ms), and the frontend-stale cutoff (`2 × Hz` ≈ 2 s of zero crossings). frontend: selects the MAX31865 noise-rejection filter notch (50/60 Hz) written at sensor startup. |
-| `pid.kp` / `ki` / `kd` | frontend | PID gains handed to the controller at construction (§9.3). |
+| `pid.kp` / `ki` / `kd` | frontend | PID gains handed to the controller at construction (§9.5). |
+| `feedforward.process_gain_c` / `ambient_c` | frontend | Holding-feedforward gain and reference; `u_ff = (setpoint − ambient_c)/process_gain_c`. A zero gain disables feedforward (§9.6). |
 | `sensor.ref_resistor_ohms` | frontend | MAX31865 reference resistor `Rref`, trimmed at the ice point; scales the RTD resistance reading (§9.1). |
 | `sensor.temp_cal_gain` / `temp_cal_offset` | frontend | Two-point span correction applied to the temperature, `T_true = gain·T + offset` (§9.2). |
 | `element*.watts` / `area_cm2` | frontend | Loaded into the config struct; reserved for the planned watts→duty / power-density control law — not yet consumed by the loop. |
@@ -584,27 +638,340 @@ are `sensor.temp_cal_gain = 1.0528`, `sensor.temp_cal_offset = -0.032`.
 > boiling point is **94.7 °C**, and the §9.1-trimmed RTD should read ~90.0 °C
 > there. Re-derive both keys for your own probe and altitude.
 
-### 9.3 PID tuning
+### 9.3 Process model
+
+The Laplace-domain model of the signal chain from duty command to measured
+temperature has three cascaded stages: the kettle thermal plant, the RTD probe
+lag, and the software filter.
+
+#### Signal chain
+
+```
+  u ──►[ ×P_max ]──► P ──►[ G_plant ]──► T_kettle ──►[ G_probe ]──►[ G_filt ]──► T_meas ──► PID
+ (duty)    [W]            K_p/(τ_p s+1)              1/(τ_pr s+1)   2× N-boxcar
+
+           plant heat loss: T_kettle relaxes toward ambient T_amb at rate h·(T_kettle−T_amb)
+```
+
+#### Kettle thermal plant
+
+Energy balance of a well-stirred (recirculated) kettle, linearised about an
+operating point:
+
+```
+m · c_p · dT/dt = P_in − h · (T − T_amb)
+
+G_plant(s) = T(s)/P(s) = K_plant / (τ_plant · s + 1)
+
+  K_plant   = 1/h              [°C/W]    steady-state gain
+  τ_plant   = m · c_p / h     [s]       dominant time constant
+
+  m         liquid mass, kg
+  c_p       4 186 J/(kg·°C)  for water
+  h         total heat-loss coefficient, W/°C
+            (conduction through walls + lid, radiation, evaporation)
+```
+
+For a 30 L batch in a reasonably insulated kettle `τ_plant` is typically
+**20–40 minutes**.  The heat-loss coefficient `h` is small, making `K_plant`
+large; their ratio `P_max / (m · c_p)` is the initial ramp rate at full power
+and is easy to measure directly from the step test.
+
+#### RTD probe lag
+
+The PT100 probe has its own thermal mass that causes a first-order lag before
+it reaches the liquid temperature:
+
+```
+G_probe(s) = 1 / (τ_probe · s + 1)
+
+  τ_probe ≈ 5–30 s   (depends on probe mass, immersion depth, flow past tip)
+```
+
+#### Software filter
+
+The `SecondOrderAverage` filter consists of two cascaded N = 40 sample
+boxcar stages running at the MAX31865 continuous-conversion rate `f_s`
+(≈ 60 Hz / 16.7 ms at the 60 Hz notch, 50 Hz / 20 ms at the 50 Hz notch — one
+sample per mains cycle).  Each boxcar introduces a group delay of
+`(N−1)/(2·f_s) ≈ 0.33 s`, so the two stages together add approximately:
+
+```
+Total filter group delay ≈ N / f_s ≈ 0.65 s   (at 60 Hz notch, N = 40)
+```
+
+For controller design the filter is approximated as a pure lag equal to its
+group delay, absorbed into the effective dead time `L` below.
+
+#### Combined open-loop transfer function
+
+Duty command to measured temperature:
+
+```
+G(s) = P_max · G_plant(s) · G_probe(s) · G_filt(s)
+
+     = K_total / ((τ_plant·s+1) · (τ_probe·s+1) · (τ_filt·s+1)²)
+
+  K_total = P_max / h = (watts1 + watts2) / h   [°C per unit duty]
+```
+
+Because `τ_plant` dominates, the higher-order poles (probe, filter) are
+absorbed into an effective dead time to give the **First-Order Plus Dead Time
+(FOPDT) approximation** used for tuning:
+
+```
+G_FOPDT(s) = K · e^(−L·s) / (τ · s + 1)
+
+  K   ≈ K_total = (watts1 + watts2) / h     [°C / unit duty]
+  τ   ≈ τ_plant                             [s]   dominant time constant
+  L   ≈ τ_probe + N / f_s                   [s]   effective dead time
+```
+
+The ratio `L/τ` characterises controllability: `L/τ < 0.3` is straightforward
+to control; values above 1.0 indicate a sluggish, delay-dominated plant.  For
+a typical BIAB kettle, `L/τ` is well below 0.05 — the dominant challenge is
+the large time constant, not the dead time.
+
+#### Gain conventions — continuous vs. INI
+
+The bibby PID accumulates raw error counts (`integral_ += error`, not
+`+= error·dt`) and computes raw deltas for the derivative (`deriv = e[n]−e[n−1]`,
+not divided by `dt`).  The INI gains therefore relate to continuous-time gains
+by:
+
+```
+kp_ini  = Kp_c                     (no scaling)
+ki_ini  = Ki_c · T_s               (T_s = sample period from CSV)
+kd_ini  = Kd_c / T_s
+```
+
+`T_s` is estimated automatically from the `t_monotonic_s` column of the log.
+
+---
+
+### 9.4 System identification
+
+The parameters `K`, `τ`, and `L` of the FOPDT model are obtained from an
+**open-loop step test**: drive a constant manual duty and record the filtered
+temperature response.  The Python script `tools/identify_plant.py` fits the
+model and computes PID gains automatically.
+
+#### Step-test procedure
+
+The test requires the kettle to be filled and recirculated, but the heater does
+not need to be at any particular starting temperature.
+
+1. **Fill** the kettle to the intended brew volume and start the recirculation
+   pump.  Good mixing is required for the lumped-thermal-mass model to hold.
+2. **Stabilise.** Let the temperature settle for a few minutes with manual duty
+   at 0 %.  Note the starting temperature.
+3. **Apply the step.** In the bibby UI:
+   - Switch to **Manual Control**.
+   - Set the duty slider to **30–50 %** (enough power to produce a clear signal
+     while staying well clear of boiling for at least 15 minutes).
+   - Leave the duty at that value for the duration of the test.
+4. **Log.** The CSV logger runs continuously.  Let the brew run until the
+   temperature has risen **15–25 °C** above the starting value, or for at least
+   **15 minutes** — whichever comes first.
+5. **End the test.** Return the duty slider to 0 and switch back to manual.
+   Note the wall-clock time so you can locate the step in the CSV log.
+6. **Copy the log** from `~/bibby/logs/YYYY/MM/DD/HH-MM-SS.csv` to your
+   analysis machine.
+
+> **Practical notes:**
+> - Both SSRs are commanded by the same slider in manual mode, so the total
+>   power step is `duty × (watts1 + watts2)`.
+> - A stable, calm starting temperature is important; avoid running the test
+>   immediately after a previous heating phase.
+> - If the liquid reaches boiling during the test, stop immediately — the model
+>   changes once evaporative cooling becomes significant.
+
+#### Identifying the step window
+
+Open the CSV in a spreadsheet or text editor and note two timestamps from the
+`t_monotonic_s` column:
+
+| Landmark | How to find it |
+|---|---|
+| `t_start` | The sample just before the duty jumps from 0 to the step value |
+| `t_end`   | The last sample before you returned the duty to 0 |
+
+Pass these as `--t-start` and `--t-end` (both in seconds from the log start,
+i.e., `t_monotonic_s − t_monotonic_s[0]`).
+
+#### Running the identification script
+
+```
+# Install dependencies once
+pip3 install numpy scipy matplotlib pandas
+
+# Basic run (auto-detects duty from the log)
+python3 tools/identify_plant.py logs/YYYY/MM/DD/HH-MM-SS.csv \
+        --t-start 120 --t-end 1020
+
+# Specify duty explicitly (more reliable), with λ ≈ L for a moderately fast loop
+python3 tools/identify_plant.py logs/YYYY/MM/DD/HH-MM-SS.csv \
+        --t-start 120 --t-end 1020 --duty 0.40 --lambda 30
+
+# Save the plot to a file
+python3 tools/identify_plant.py logs/YYYY/MM/DD/HH-MM-SS.csv \
+        --t-start 120 --t-end 1020 --duty 0.40 -o step_fit.png
+```
+
+The script prints a summary and ready-to-paste `[pid]` and `[feedforward]`
+blocks (illustrative numbers below):
+
+```
+── FOPDT model ────────────────────────────────────────────────
+  K   (process gain)  = 73.4  °C per unit duty
+  τ   (time constant) = 1823  s  (30.4 min)
+  L   (dead time)     = 28.6  s
+  L/τ (relative DT)   = 0.0157  (easy to control)
+  Fit RMSE            = 0.041  °C
+
+── bibby.ini gains  (dt = 16.7 ms, discrete, gains folded) ──
+
+  ── IMC-PI  (λ=30.0 s)
+  [pid]
+  kp = 0.423831
+  ki = 0.00000388
+  kd = 0.00000
+
+── bibby.ini feedforward  (holding-duty feedforward, README §9.6) ──
+  [feedforward]
+  process_gain_c = 73.40      # identified K, °C per unit duty
+  ambient_c      = 21.50      # window start temp; use cold-soak/room temp
+```
+
+The plot shows the measured temperature, the FOPDT fit, the duty trace, and
+the fit residuals — inspect the residuals to confirm the model fits well.
+
+#### What the model parameters tell you
+
+| Parameter | Physical meaning | Implication |
+|---|---|---|
+| `K` | Total power / heat-loss coefficient | Large K means the heater dominates; steady state is well above ambient |
+| `τ` | Thermal time constant of the full batch | Larger batch = larger τ; the loop can afford slower response |
+| `L` | Probe lag + filter delay | Limits how aggressively you can tune; keep the probe well-immersed |
+| `L/τ` | Relative dead time | < 0.1 is easy; > 0.5 requires careful detuning |
+
+---
+
+### 9.5 PID tuning
 
 The control law is in place but **un-tuned** — the default gains are zero, so
 auto mode commands zero power until you set `pid.kp/ki/kd` in `bibby.ini` (§7).
 
-Suggested approach for a kettle (a slow, dominant first-order-plus-dead-time
-thermal plant):
+#### Choosing a tuning rule
 
-1. Drive a known constant duty in manual mode and log the temperature step
-   (§10). From the response, estimate the process gain, time constant, and dead
-   time.
-2. Apply a tuning rule (e.g. Cohen–Coon or Ziegler–Nichols open-loop) for a
-   first estimate of `kp_/ki_/kd_`, remembering the output is the *duty fraction*
-   in `[0,1]` and the loop runs once per filtered sample.
-3. Refine against logged step responses; favor a modest, non-oscillatory
-   response — overshoot in a mash step costs enzyme activity.
-4. The integrator is bounded by `INTEGRAL_MAX` for anti-windup; size it so a
-   saturated integral alone can command full power (`ki_ * INTEGRAL_MAX ≈ 1`).
+The script offers three rules.  All are derived from the FOPDT model fit (§9.4):
 
-The CSV log (P/I/D contributions, integrator and derivative state, error,
-output) is intended exactly for this tuning work.
+| Rule | Characteristic | When to use |
+|---|---|---|
+| **IMC-PI** | Smooth, no overshoot; λ sets the trade-off between speed and robustness | First choice for BIAB; tune λ to taste |
+| **ZN-PID** | Aggressive, ~25 % overshoot | Upper bound; useful to understand the fastest achievable loop |
+| **CC-PID** | Balanced, works well at moderate `L/τ` | Good sanity check against IMC |
+
+For a mash process, **IMC-PI** with `λ ≈ L` (the dead time) is a good starting
+point.  Overshoot during a mash step costs enzyme activity, so err towards a
+larger λ (slower, more conservative).
+
+```bash
+# Try IMC-PI with λ = 60 s (more conservative)
+python3 tools/identify_plant.py logs/... --rule imc --lambda 60
+```
+
+#### Anti-windup
+
+The primary anti-windup is **conditional integration** (`pid.cpp`): the
+integrator is held whenever the commanded output is already against a rail
+(0 or 1) and the current error would push it further into that rail.  This keeps
+the integrator from winding up against a saturated output, and — once a holding
+feedforward is configured (§9.6) — confines it to the `[−u_ff, 1−u_ff]` band the
+feedforward leaves available.  A hard `±INTEGRAL_MAX` clamp (`pid.cpp`) is a
+secondary backstop.
+
+How much integral authority you need depends on whether you use feedforward:
+
+- **With feedforward (§9.6):** the feedforward supplies the steady-state holding
+  power, so the integrator only trims model error.  A small authority is fine —
+  the script's low-authority message is informational in this case.
+- **Without feedforward:** the integrator must supply *all* the holding power, so
+  it needs real authority.  If the script reports `ki × INTEGRAL_MAX` below
+  ~10 %, raise `INTEGRAL_MAX` in `frontend/pid.cpp` so `ki × INTEGRAL_MAX ≥ 0.5`
+  and rebuild, or accept a small steady-state offset held by the proportional
+  term alone.
+
+#### Applying gains and validating
+
+1. Copy the `[pid]` block printed by the script into `bibby.ini` (and the
+   `[feedforward]` block too, if using feedforward — see §9.6).
+2. Restart the frontend (or kill and relaunch to reload the config).
+3. Set a **setpoint 5–10 °C above** the current temperature and switch to
+   **Auto** mode.  Observe the temperature on the history graph.
+4. A well-tuned response rises smoothly and settles with no or minimal
+   overshoot.  If it oscillates, increase λ and rerun the script.
+5. Log the validation run and inspect `pid_ff`, `pid_p`, `pid_i`, `pid_d`
+   columns to confirm the split between feedforward and feedback is sensible,
+   the integral is only trimming, and the derivative is not amplifying noise.
+
+The CSV columns `pid_ff`, `pid_p`, `pid_i`, `pid_d`, `pid_integral`,
+`pid_deriv`, `pid_error`, and `pid_output` are specifically provided for this
+tuning and validation work.
+
+---
+
+### 9.6 Feedforward (optional, recommended)
+
+A kettle spends most of a brew *holding* a temperature against heat loss.  Left
+to the PID alone, the integrator has to wind all the way up to supply that
+holding power — slow to converge and a source of overshoot.  A **holding
+feedforward** supplies it directly instead, leaving the feedback to trim only
+the model error.
+
+#### The control law
+
+```
+u_ff    = clamp( (setpoint − ambient_c) / K , 0, 1 )     // holding duty
+u_total = clamp( u_ff + (P + I + D) , 0, 1 )             // feedforward + feedback
+```
+
+`K` is the identified process gain (°C per unit duty, §9.4) and `ambient_c` is a
+reference temperature — both live in the `[feedforward]` section of `bibby.ini`.
+Because `K` is exactly what `identify_plant.py` prints, the step test that tunes
+the PID also sizes the feedforward; the script prints a ready-to-paste
+`[feedforward]` block.  Setting `process_gain_c = 0` disables feedforward (the
+safe default).
+
+#### Why it does not destabilise or overshoot
+
+- **It does not change loop stability.** `u_ff` depends on the *setpoint*, not
+  the *measurement*, so it sits outside the feedback loop.  The closed-loop
+  characteristic equation — and therefore stability and the response shape — are
+  unchanged; feedforward only adds a known bias (superposition).
+- **It does not cause overshoot.** Driving the plant with exactly its
+  steady-state holding power produces a monotonic, first-order approach to the
+  setpoint (no overshoot), just slow; the feedback adds the transient push.
+  Feedforward *reduces* overshoot versus an integrator that must wind up from
+  zero.  The only way feedforward overshoots is if it is **over-sized** — e.g.
+  `K` under-estimated, so `u_ff` exceeds the true holding duty and the kettle
+  settles above setpoint until the integrator pulls it back.  Keep `K` honest
+  (use the identified value); if anything, a slight under-estimate is the safe
+  direction.
+- **It lowers the integral-authority requirement.** With the holding power
+  supplied by feedforward, the integrator only covers the feedforward's model
+  error (typically a small fraction of full duty), so `INTEGRAL_MAX` can be
+  small.  The conditional-integration anti-windup (§9.5) automatically confines
+  the integrator to the headroom the feedforward leaves.
+
+#### Estimating `ambient_c`
+
+`ambient_c` is the temperature the kettle sits at with no power.  The simplest
+estimate is the cold-start temperature at the beginning of the step test, which
+the script prints.  It need not be exact: any error in `ambient_c` (or `K`) just
+becomes a small bias the integrator removes.  Feedforward is only active in auto
+mode, and an RTD fault still forces manual control, so it never drives the
+relays on bad data.
 
 ---
 
@@ -622,9 +989,12 @@ the data on disk. Columns:
 
 ```
 wall_time, t_monotonic_s, temp_raw_c, temp_filt_c, setpoint_c,
-duty1, duty2, pid_output, pid_error, pid_p, pid_i, pid_d,
+duty1, duty2, pid_output, pid_ff, pid_error, pid_p, pid_i, pid_d,
 pid_integral, pid_deriv, manual, grain_in, rtd_fault, watchdog
 ```
+
+- `pid_ff` is the holding-feedforward duty (§9.6); `pid_output` is the total
+  commanded duty `clamp(pid_ff + pid_p + pid_i + pid_d)`.
 
 - `wall_time` is ISO-8601 local time with milliseconds; `t_monotonic_s` is the
   SDL monotonic clock. Recover the sample interval `dt` from either.
@@ -660,6 +1030,8 @@ bibby/
 │   ├── shm_types.h            HeaterShm shared-memory layout
 │   ├── config.{h,c}           bibby.ini loader (both processes)
 │   └── single_instance.h      flock single-instance guard
+├── tools/
+│   └── identify_plant.py      FOPDT identification + PID tuning script (§9.4–9.5)
 ├── pi_hat/bibby_pi_hat/       KiCad schematic + PCB + gerbers
 └── third_party/imgui/         vendored Dear ImGui (submodule)
 ```

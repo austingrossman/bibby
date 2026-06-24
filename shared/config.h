@@ -19,6 +19,13 @@ typedef struct {
   float pid_kp;              // PID proportional gain
   float pid_ki;              // PID integral gain
   float pid_kd;              // PID derivative gain
+  // Holding feedforward: the steady-state duty to maintain the setpoint is
+  // u_ff = (setpoint - ambient_c) / process_gain_c, added ahead of the PID so
+  // the feedback only trims model error. process_gain_c is the identified
+  // process gain K (deg C per unit duty, from tools/identify_plant.py). A zero
+  // process_gain_c disables feedforward (the safe default). See README §9.6.
+  float ff_process_gain_c;  // K, deg C per unit duty; 0 disables feedforward
+  float ff_ambient_c;       // ambient/reference temperature, deg C
   // Per-unit RTD calibration (depends on the specific probe + reference
   // resistor). Identity defaults (400 Ohm, gain 1, offset 0) leave the sensor
   // uncalibrated; the as-built trims live in bibby.ini. See README §9.

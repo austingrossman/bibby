@@ -67,6 +67,7 @@ struct UiControls {
 };
 
 static HeaterShm          *shm_connect();
+static void                sleep_ms(long ms);
 static void                ensure_heater_controller();
 static gpiod_line_request *init_drdy_line(gpiod_chip *chip);
 static SDL_Window         *create_window(SDL_GLContext *out_ctx, int *out_w, int *out_h);
@@ -125,6 +126,15 @@ int main(void) {
   bool  grain_in       = false;
   bool  running        = true;
 
+  // Sampling runs every loop iteration; the UI renders on a fixed cadence.
+  // vsync is off (see create_window) so SwapWindow never parks the loop, which
+  // lets us poll DRDY every ~1 ms — far faster than the MAX31865's 16.7 ms
+  // (60 Hz notch) / 20 ms (50 Hz notch) continuous-conversion rate. So no
+  // conversion is missed, and since a register read clears DRDY (datasheet,
+  // "DRDY Operation"), none is read twice.
+  const double frame_period = 1.0 / 60.0;   // UI refresh cadence, independent of sampling
+  double next_frame = SDL_GetTicks() / 1000.0;
+
   while (running) {
     double now = SDL_GetTicks() / 1000.0;
 
@@ -145,13 +155,23 @@ int main(void) {
       }
     }
 
-    // --- Sensor: smooth fresh readings, hold the last value otherwise ---
+    // --- Sensor: polled every iteration so a conversion is never missed.
+    //     Smooth fresh readings, hold the last value otherwise. ---
     bool  temp_fresh = false;
     float temp_raw   = sensor.read_temperature(&temp_fresh);
     if (temp_fresh) {
       temp_c   = temp_filter.push(temp_raw);
       temp_history.push(temp_c, now);
-      pid_duty = pid.update(temp_c, setpoint_c);  // run the controller on each new sample
+      // Holding feedforward: the steady-state duty to maintain the setpoint,
+      // added ahead of the PID so feedback only trims model error. Depends on
+      // the setpoint, not the measurement, so it is safe to compute always; a
+      // zero process gain disables it. See README §9.6.
+      float feedforward = 0.0f;
+      if (cfg.ff_process_gain_c > 0.0f) {
+        feedforward = (setpoint_c - cfg.ff_ambient_c) / cfg.ff_process_gain_c;
+        feedforward = feedforward < 0.0f ? 0.0f : (feedforward > 1.0f ? 1.0f : feedforward);
+      }
+      pid_duty = pid.update(temp_c, setpoint_c, feedforward);  // run the controller on each new sample
     }
 
     // --- Control mode ---
@@ -160,28 +180,12 @@ int main(void) {
     // Safety (CLAUDE.md): with unreliable temperature only manual control may
     // drive the SSRs. Force manual so the PID path cannot command power.
     if (!temp_reliable) manual_control = true;
-    // In auto, the PID drives both SSRs (currently zero). In manual, the sliders
-    // do, set inside draw_ui below.
+    // In auto, the PID drives both SSRs. In manual, the sliders do (set inside
+    // draw_ui, i.e. at the render cadence below).
     if (!manual_control) {
       duty1 = pid_duty;
       duty2 = pid_duty;
     }
-
-    // --- Controller status from shared memory ---
-    UiStatus status;
-    status.temp_c    = temp_c;
-    status.out1      = shm->output1;
-    status.out2      = shm->output2;
-    // Glow ramps toward each output with a one-pole IIR:
-    //   bright[n] = damp*output[n] + (1-damp)*bright[n-1].
-    constexpr float damp_factor = 0.2f;
-    bright1 += damp_factor * ((status.out1 ? 1.0f : 0.0f) - bright1);
-    bright2 += damp_factor * ((status.out2 ? 1.0f : 0.0f) - bright2);
-    status.bright1   = bright1;
-    status.bright2   = bright2;
-    status.watchdog  = shm->watchdog_alarm;
-    status.drdy_high = gpiod_line_request_get_value(drdy_req, DRDY_GPIO) == GPIOD_LINE_VALUE_ACTIVE;
-    status.rtd_fault = rtd_fault;
 
     // --- Log one row per fresh sample (PID has just run on this sample) ---
     if (temp_fresh && logger.ok()) {
@@ -196,31 +200,55 @@ int main(void) {
       row.manual        = manual_control;
       row.grain_in      = grain_in;
       row.rtd_fault     = rtd_fault;
-      row.watchdog      = status.watchdog;
+      row.watchdog      = shm->watchdog_alarm;
       logger.log(row);
     }
 
-    // --- Render the UI into the portrait FBO ---
-    display.begin_frame();
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplSDL3_NewFrame();
-    io.DisplaySize             = ImVec2((float)display.portrait_w(), (float)display.portrait_h());
-    io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
-
-    ImGui::NewFrame();
-    UiControls ctl{ &duty1, &duty2, &test_pressed, &setpoint_c, &manual_control, &grain_in };
-    draw_ui(display.portrait_w(), display.portrait_h(), status, ctl, temp_history, now);
-    ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-    display.present();
-    SDL_GL_SwapWindow(window);
-
-    // --- Publish control state back to the heater-controller ---
+    // --- Publish control state to the heater-controller every iteration, so
+    //     duty updates and the liveness heartbeat aren't gated by the UI rate ---
     shm->duty1            = duty1;
     shm->duty2            = duty2;
     shm->simulate_zc      = test_pressed;
     shm->frontend_iteration++;
+
+    // --- Render the UI at the fixed cadence. vsync is off, so SwapWindow
+    //     returns promptly and never stalls the sampling above. ---
+    if (now >= next_frame) {
+      next_frame += frame_period;
+      if (next_frame < now) next_frame = now + frame_period;  // don't spiral after a stall
+
+      UiStatus status;
+      status.temp_c    = temp_c;
+      status.out1      = shm->output1;
+      status.out2      = shm->output2;
+      // Glow ramps toward each output with a one-pole IIR:
+      //   bright[n] = damp*output[n] + (1-damp)*bright[n-1].
+      constexpr float damp_factor = 0.2f;
+      bright1 += damp_factor * ((status.out1 ? 1.0f : 0.0f) - bright1);
+      bright2 += damp_factor * ((status.out2 ? 1.0f : 0.0f) - bright2);
+      status.bright1   = bright1;
+      status.bright2   = bright2;
+      status.watchdog  = shm->watchdog_alarm;
+      status.drdy_high = gpiod_line_request_get_value(drdy_req, DRDY_GPIO) == GPIOD_LINE_VALUE_ACTIVE;
+      status.rtd_fault = rtd_fault;
+
+      display.begin_frame();
+      ImGui_ImplOpenGL3_NewFrame();
+      ImGui_ImplSDL3_NewFrame();
+      io.DisplaySize             = ImVec2((float)display.portrait_w(), (float)display.portrait_h());
+      io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+
+      ImGui::NewFrame();
+      UiControls ctl{ &duty1, &duty2, &test_pressed, &setpoint_c, &manual_control, &grain_in };
+      draw_ui(display.portrait_w(), display.portrait_h(), status, ctl, temp_history, now);
+      ImGui::Render();
+      ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+      display.present();
+      SDL_GL_SwapWindow(window);
+    }
+
+    sleep_ms(1);  // ~16 DRDY polls per conversion; keeps CPU use modest
   }
 
   gpiod_line_request_release(drdy_req);
@@ -349,7 +377,9 @@ static SDL_Window *create_window(SDL_GLContext *out_ctx, int *out_w, int *out_h)
     "BIAB Ramp Controller", *out_w, *out_h,
     SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
   *out_ctx = SDL_GL_CreateContext(window);
-  SDL_GL_SetSwapInterval(1);
+  // vsync off: SwapWindow must not block the main loop, so DRDY can be polled
+  // every ~1 ms (see the loop in main) rather than once per display refresh.
+  SDL_GL_SetSwapInterval(0);
   return window;
 }
 

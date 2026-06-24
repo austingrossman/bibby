@@ -32,7 +32,7 @@ Two separate processes communicate via POSIX shared memory (`/biab_heater`).
 - Columns: `wall_time, t_monotonic_s, temp_raw_c, temp_filt_c, setpoint_c, duty1, duty2, pid_output, pid_error, pid_p, pid_i, pid_d, pid_integral, pid_deriv, manual, grain_in, rtd_fault, watchdog`.
 
 ## MAX31865 Sensor — `frontend/sensors/max31865.{h,cpp}`
-- PT100, 3-wire, 400Ω reference resistor
+- PT100, 3-wire, 400Ω reference resistor, set to continuous conversion mode, so sample rate of temp samples is 50/60Hz.
 - SPI: `/dev/spidev0.0`, 1 MHz, SPI_MODE_1
 - Constructor sequence: set 3-wire + fault-clear + mains filter notch → enable Vbias (10ms wait) → enable auto-conversion → discard first 10 samples using DRDY polling
 - Mains filter: config reg bit 0 selects the noise-rejection notch (set = 50 Hz, clear = 60 Hz); the `mains_hz` ctor arg (from `bibby.ini`) sets it. Must be chosen before auto-conversion is enabled (datasheet)

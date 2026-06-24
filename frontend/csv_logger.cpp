@@ -52,7 +52,7 @@ CsvLogger::CsvLogger() {
 
   fprintf(f_,
           "wall_time,t_monotonic_s,temp_raw_c,temp_filt_c,setpoint_c,"
-          "duty1,duty2,pid_output,pid_error,pid_p,pid_i,pid_d,"
+          "duty1,duty2,pid_output,pid_ff,pid_error,pid_p,pid_i,pid_d,"
           "pid_integral,pid_deriv,manual,grain_in,rtd_fault,watchdog\n");
   fflush(f_);
 }
@@ -75,10 +75,10 @@ void CsvLogger::log(const LogSample &s) {
 
   const PidTerms &p = s.pid;
   fprintf(f_,
-          "%s,%.3f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,"
+          "%s,%.3f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,"
           "%.6g,%.6g,%d,%d,%u,%d\n",
           wall, s.t_monotonic_s, s.temp_raw_c, s.temp_filt_c, s.setpoint_c,
-          s.duty1, s.duty2, p.output, p.error, p.p, p.i, p.d,
+          s.duty1, s.duty2, p.output, p.ff, p.error, p.p, p.i, p.d,
           p.integral, p.deriv, s.manual ? 1 : 0, s.grain_in ? 1 : 0,
           (unsigned)s.rtd_fault, s.watchdog ? 1 : 0);
   fflush(f_);

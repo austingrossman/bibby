@@ -20,6 +20,8 @@ static void set_defaults(BibbyConfig *cfg) {
   cfg->pid_kp            = 0.0f;
   cfg->pid_ki            = 0.0f;
   cfg->pid_kd            = 0.0f;
+  cfg->ff_process_gain_c = 0.0f;  // feedforward disabled until K is set
+  cfg->ff_ambient_c      = 20.0f; // nominal room temperature
   cfg->sensor_ref_resistor_ohms = 400.0f; // nominal Rref, no ice-point trim
   cfg->sensor_temp_cal_gain     = 1.0f;   // identity span (uncalibrated)
   cfg->sensor_temp_cal_offset   = 0.0f;
@@ -45,6 +47,8 @@ static void apply(BibbyConfig *cfg, const char *key, const char *val) {
   else if (!strcmp(key, "pid.kp"))             cfg->pid_kp            = (float)atof(val);
   else if (!strcmp(key, "pid.ki"))             cfg->pid_ki            = (float)atof(val);
   else if (!strcmp(key, "pid.kd"))             cfg->pid_kd            = (float)atof(val);
+  else if (!strcmp(key, "feedforward.process_gain_c")) cfg->ff_process_gain_c = (float)atof(val);
+  else if (!strcmp(key, "feedforward.ambient_c"))      cfg->ff_ambient_c      = (float)atof(val);
   else if (!strcmp(key, "sensor.ref_resistor_ohms")) cfg->sensor_ref_resistor_ohms = (float)atof(val);
   else if (!strcmp(key, "sensor.temp_cal_gain"))     cfg->sensor_temp_cal_gain     = (float)atof(val);
   else if (!strcmp(key, "sensor.temp_cal_offset"))   cfg->sensor_temp_cal_offset   = (float)atof(val);
