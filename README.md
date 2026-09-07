@@ -667,55 +667,128 @@ software filter.
 #### Kettle thermal plant
 
 Energy balance of a well-stirred (recirculated) kettle, linearised about an
-operating point:
+operating point: the stored energy rises with the electrical power poured in
+and falls with the heat leaking to the room.
 
-```
-m · c_p · dT/dt = P − k_loss · (T − T_amb)
+$$m\,c_p\,\frac{dT}{dt} \;=\; P \;-\; k_{\text{loss}}\,\bigl(T - T_{\text{amb}}\bigr)$$
 
-G_plant(s) = T(s)/P(s) = K / (τ · s + 1)
+| Symbol | Meaning | Units |
+|---|---|---|
+| $T$ | kettle liquid temperature — the controlled variable | °C |
+| $T_{\text{amb}}$ | ambient temperature the kettle relaxes toward unpowered | °C |
+| $P$ | total electrical power delivered by the elements — the manipulated variable | W |
+| $m$ | liquid mass | kg |
+| $c_p$ | specific heat, 4186 for water | J/(kg·°C) |
+| $k_{\text{loss}}$ | total heat-loss coefficient (conduction through walls and lid, radiation, evaporation) | W/°C |
 
-  K       = 1/k_loss        [°C/W]   steady-state gain
-  τ       = m·c_p / k_loss  [s]      dominant time constant
+Work in deviation variables so the constant ambient term drops out. Let
+$\theta \equiv T - T_{\text{amb}}$; with $T_{\text{amb}}$ constant
+$\dot\theta = \dot T$, so
 
-  m       liquid mass, kg
-  c_p     4186 J/(kg·°C) for water
-  k_loss  total heat-loss coefficient, W/°C
-          (conduction through walls + lid, radiation, evaporation)
-```
+$$m\,c_p\,\dot\theta + k_{\text{loss}}\,\theta \;=\; P$$
 
-For a 30 L batch in a reasonably insulated kettle τ is typically **20–40
-minutes**. The initial ramp rate at power `P` is `P/(m·c_p)` — easy to check
-directly against the step test, and the basis of the online m·c estimator
+Laplace transform, starting from the operating point so $\theta(0) = 0$:
+
+$$m\,c_p\,s\,\Theta(s) + k_{\text{loss}}\,\Theta(s) \;=\; P(s)
+\quad\Longrightarrow\quad
+\bigl(m\,c_p\,s + k_{\text{loss}}\bigr)\,\Theta(s) \;=\; P(s)$$
+
+Solve for the transfer function and divide numerator and denominator by
+$k_{\text{loss}}$ to reach standard first-order form:
+
+$$G_{\text{plant}}(s) \;=\; \frac{\Theta(s)}{P(s)}
+\;=\; \frac{1}{m\,c_p\,s + k_{\text{loss}}}
+\;=\; \frac{1/k_{\text{loss}}}{\dfrac{m\,c_p}{k_{\text{loss}}}\,s + 1}
+\;=\; \frac{K}{\tau s + 1}$$
+
+$$K = \frac{1}{k_{\text{loss}}}\ \left[\text{°C/W}\right]
+\qquad
+\tau = \frac{m\,c_p}{k_{\text{loss}}}\ \left[\text{s}\right]$$
+
+where $K$ is the steady-state gain (°C of rise per watt held) and $\tau$ the
+dominant time constant.
+
+For a 30 L batch in a reasonably insulated kettle $\tau$ is typically **20–40
+minutes**. The initial ramp rate at power $P$ is $P/(m\,c_p)$ — easy to check
+directly against the step test, and the basis of the online $m\,c$ estimator
 (§2.7).
 
 #### RTD probe lag
 
-The PT100 probe has its own thermal mass causing a first-order lag:
+The PT100 element sits inside a sheath with its own thermal mass, so it reports
+a lagged version of the liquid temperature. Treating the sheath as a lumped
+mass exchanging heat with the liquid through a film conductance gives the same
+first-order form as the kettle:
 
-```
-G_probe(s) = 1 / (τ_probe · s + 1),   τ_probe ≈ 5–30 s
-```
+$$m_{\text{pr}}\,c_{\text{pr}}\,\frac{dT_{\text{pr}}}{dt}
+\;=\; h A\,\bigl(T - T_{\text{pr}}\bigr)
+\quad\Longrightarrow\quad
+\tau_{\text{probe}}\,\dot T_{\text{pr}} + T_{\text{pr}} \;=\; T$$
+
+$$G_{\text{probe}}(s) \;=\; \frac{T_{\text{pr}}(s)}{T(s)}
+\;=\; \frac{1}{\tau_{\text{probe}}\,s + 1},
+\qquad \tau_{\text{probe}} = \frac{m_{\text{pr}}\,c_{\text{pr}}}{hA}
+\;\approx\; 5\text{–}30\ \text{s}$$
+
+| Symbol | Meaning | Units |
+|---|---|---|
+| $T_{\text{pr}}$ | temperature the probe actually reports | °C |
+| $T$ | true liquid temperature (the plant output above) | °C |
+| $m_{\text{pr}} c_{\text{pr}}$ | thermal mass of the sheath and element | J/°C |
+| $hA$ | film conductance from liquid to sheath | W/°C |
+| $\tau_{\text{probe}}$ | probe time constant — thin bare sheath at the low end, thick thermowell at the high end | s |
+
+Its DC gain is 1: the probe eventually reaches the liquid temperature, it just
+gets there late. That is why $\tau_{\text{probe}}$ shows up as dead time in the
+FOPDT fit rather than as a gain error.
 
 #### Software filter
 
-The default filter is two cascaded N = 40 boxcars at the sensor rate
-`f_s` (≈ 60 Hz — one conversion per mains cycle). Each boxcar contributes
-`(N−1)/(2·f_s) ≈ 0.33 s` of group delay; both together ≈ 0.65 s, absorbed into
-the dead time below.
+The default filter is $n = 2$ cascaded boxcars of $N = 40$ samples each, run at
+the sensor rate $f_s \approx 60\ \text{Hz}$ (one conversion per mains cycle).
+A single $N$-sample boxcar is
+
+$$G_{\text{box}}(z) \;=\; \frac{1}{N}\sum_{k=0}^{N-1} z^{-k},
+\qquad
+G_{\text{filt}}(z) \;=\; \bigl[G_{\text{box}}(z)\bigr]^{\,n}$$
+
+Its taps are uniform, so the group delay is the mean tap index — $(N-1)/2$
+samples — and $n$ identical stages in series simply add:
+
+$$L_{\text{filt}}
+\;=\; \frac{n\,(N-1)}{2\,f_s}
+\;=\; \frac{2 \cdot 39}{2 \cdot 60}
+\;\approx\; 0.65\ \text{s}$$
+
+with each stage contributing $(N-1)/(2 f_s) \approx 0.33\ \text{s}$. Both $n$
+and $N$ are `filter.order` / `filter.window` in the INI; changing them changes
+the dead time below, so re-identify the plant afterward.
 
 #### Combined FOPDT approximation
 
-```
-G_FOPDT(s) = K · e^(−L·s) / (τ · s + 1)
+Cascading the three stages gives a third-order model. The two small lags —
+probe and filter — are far faster than the kettle, so the standard reduction
+(Skogestad half-rule, in the limit where the small time constants are much
+smaller than the dominant one) folds them into a pure delay:
 
-  K   ≈ 1/k_loss                [°C/W]
-  τ   ≈ m·c_p / k_loss          [s]
-  L   ≈ τ_probe + filter delay  [s]
-```
+$$G(s) \;=\; \underbrace{\frac{K}{\tau s + 1}}_{\text{kettle}}
+\cdot \underbrace{\frac{1}{\tau_{\text{probe}} s + 1}}_{\text{probe}}
+\cdot \underbrace{G_{\text{filt}}(s)}_{\text{filter}}
+\;\;\approx\;\; \frac{K\,e^{-Ls}}{\tau s + 1}$$
 
-The ratio `L/τ` characterises controllability: `< 0.3` is straightforward;
-`> 1.0` is delay-dominated. A BIAB kettle sits well below 0.3 — the challenge
-is the large time constant, not the dead time.
+using $\dfrac{1}{\tau_{\text{probe}} s + 1} \approx e^{-\tau_{\text{probe}} s}$
+for $\tau_{\text{probe}} \ll \tau$, so the delays add:
+
+$$K \approx \frac{1}{k_{\text{loss}}}\ \left[\text{°C/W}\right]
+\qquad
+\tau \approx \frac{m\,c_p}{k_{\text{loss}}}\ \left[\text{s}\right]
+\qquad
+L \approx \tau_{\text{probe}} + L_{\text{filt}}\ \left[\text{s}\right]$$
+
+The ratio $L/\tau$ characterises controllability: $L/\tau < 0.3$ is
+straightforward; $L/\tau > 1.0$ is delay-dominated. A BIAB kettle sits well
+below 0.3 — with $L \approx 10\text{–}30\ \text{s}$ against a $\tau$ of tens of
+minutes, the challenge is the large time constant, not the dead time.
 
 #### Gain conventions — continuous vs. INI
 
