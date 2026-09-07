@@ -1,0 +1,39 @@
+# bibby — brew controller systemd unit
+#
+# Install (as root):
+#   cp deploy/bibby.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now bibby
+#
+# The unit runs bibby from the build tree in ramp's home; adjust the paths
+# below for a different user or checkout location.
+
+[Unit]
+Description=bibby brew-in-a-bag temperature controller
+After=multi-user.target
+
+[Service]
+User=ramp
+SupplementaryGroups=video input spi gpio i2c
+WorkingDirectory=/home/ramp/bibby
+ExecStart=/home/ramp/bibby/build/bibby
+
+# The kernel console shares /dev/fb0 with the UI: its blinking cursor (and any
+# kernel message) draws over LVGL. Unbind it before starting; rebind on stop so
+# a stopped controller leaves a usable console. The '+' prefix runs these as
+# root even though the service itself runs as ramp.
+ExecStartPre=+/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind || true'
+ExecStopPost=+/bin/sh -c 'echo 1 > /sys/class/vtconsole/vtcon1/bind || true'
+
+# mlockall(MCL_CURRENT) needs more than the default 8 MB once LVGL is linked in.
+LimitMEMLOCK=64M
+# Lets the SSR thread take SCHED_FIFO without running the whole process as root.
+AmbientCapabilities=CAP_SYS_NICE
+
+# The controller must come back if it ever dies mid-brew. SSRs are safe during
+# the gap: the kernel drops the GPIO lines low the moment the process exits.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

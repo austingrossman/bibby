@@ -5,18 +5,22 @@ brewing, running on a Raspberry Pi 5. It reads kettle temperature from a PT100
 RTD, drives two mains heating elements through solid-state relays (SSRs), and
 presents a touch UI for setting and tracking the brew temperature. Power is
 delivered as a duty cycle synchronized to the AC mains zero crossing, and the
-whole system is built so that any fault, crash, or loss of a process leaves the
-heaters **off**.
+whole system is built so that any fault, crash, or hang leaves the heaters
+**off**.
 
 This README is meant to let someone unfamiliar with the project understand it,
 reproduce the hardware, build the software, and calibrate it for their own
 kettle. It moves from the big picture down to the details: architecture, then
 hardware, then software, then build/bring-up, then calibration.
 
-This project is for fun. I am doing it to improve my home brewing set up. I hope that someone sees inspiration in this project and does something similar. I am doing this with a couple specific goals mind
+This project is for fun. I am doing it to improve my home brewing set up. I hope
+that someone sees inspiration in this project and does something similar. I am
+doing this with a couple specific goals in mind:
 - Learn to use AI for coding purposes.
-- I recently purchased a Mac mini. I will only use a Mac for this project and it forces me to learn how to use it
-- I've recently acquired a 3D printer. This project has one 3D printed part, so I should learn how to use it.
+- I recently purchased a Mac mini. I will only use a Mac for this project and it
+  forces me to learn how to use it.
+- I've recently acquired a 3D printer. This project has one 3D printed part, so
+  I should learn how to use it.
 
 ---
 
@@ -39,178 +43,229 @@ This project is for fun. I am doing it to improve my home brewing set up. I hope
 
 ## 1. System overview
 
-The controller is split into **two cooperating processes** that talk through a
-single POSIX shared-memory segment (`/biab_heater`):
+The controller is a **single process** with three threads sharing one in-memory
+state block of C11 atomics:
 
 ```
   +----------------------------------------------------------------+
-  |                      Raspberry Pi 5                             |
+  |                    bibby (one process)                          |
   |                                                                |
-  |   +---------------------+        +-------------------------+   |
-  |   |     frontend        |        |    heater-controller    |   |
-  |   |     (C++)           |        |    (C)                  |   |
-  |   |                     | shm    |                         |   |
-  |   |  - SDL3 + ImGui UI  |<------->|  - zero-cross capture   |   |
-  |   |  - MAX31865 (SPI)   | /biab_ |  - sigma-delta SSR fire  |   |
-  |   |  - temp filter      | heater |  - watchdogs            |   |
-  |   |  - PID controller   |        |                         |   |
-  |   |  - CSV logging      |        |                         |   |
-  |   +----------+----------+        +-----+-------------+-----+   |
-  |              |                         ^             |         |
-  +--------------|-------------------------|-------------|---------+
-                 | SPI0 + DRDY             | GPIO20 ZC   | GPIO21/26
-                 v                         |             v
-          +-------------+          +-------------+   +-----------+
-          |  MAX31865   |          | zero-cross  |   |   SSR1    |
-          |  + PT100    |          | detector    |   |   SSR2    |
-          +-------------+          +-------------+   +-----------+
-                 ^                        ^               |
-                 | RTD                    | AC mains      | switched mains
-              kettle probe                line sense      to heating elements
+  |  main/UI thread          sampler thread         SSR thread     |
+  |  ---------------         ------------------     -------------  |
+  |  LVGL touch UI on        60 Hz, DRDY-paced:     SCHED_FIFO,    |
+  |  /dev/fb0 (rotated)      - MAX31865 read        ZC-paced:      |
+  |  - kettle readout        - temp filter          - zero-cross   |
+  |  - charts, slider        - PID (watts)            capture      |
+  |  - fault band            - power split          - sigma-delta  |
+  |          |               - CSV logging            SSR firing   |
+  |          |               - m*c estimator        - watchdogs    |
+  |          v                     |                     |         |
+  |  +------------------ BibbyState (C11 atomics) -------+         |
+  |            duties, temps, modes, faults, history               |
+  +----------------------------------------------------------------+
+        | SPI0 + DRDY (GPIO16)      | GPIO20 ZC     | GPIO21/26
+        v                           |               v
+  +-------------+            +-------------+   +-----------+
+  |  MAX31865   |            | zero-cross  |   |   SSR1    |
+  |  + PT100    |            | detector    |   |   SSR2    |
+  +-------------+            +-------------+   +-----------+
+        ^                          ^                |
+        | RTD                      | AC mains       | switched mains
+     kettle probe                  line sense       to heating elements
 ```
 
-- **heater-controller** owns the relays. It must be up at all times; the
-  frontend launches it if it is not already running.
-- **frontend** owns the sensor, the control law (PID), the UI, and logging. It
-  never touches the relays directly — it only writes duty-cycle commands into
-  shared memory.
+- The **SSR thread** owns the relays. It runs at real-time priority
+  (`SCHED_FIFO`) so a GUI stall can never delay the zero-cross response or the
+  watchdogs.
+- The **sampler thread** owns the sensor and the control law. It publishes
+  per-element duty commands into the shared state; it never touches the relays.
+- The **UI thread** is a pure view/controller: it renders the state and writes
+  user intent (setpoint, mode, manual watts). Nothing in it is on the control
+  or safety path.
 
-This separation keeps the safety-critical, real-time relay logic small, simple,
-and independent of the much larger GUI process.
 
 ### Why a duty cycle synchronized to zero crossing?
 
 The heating elements are resistive loads switched by zero-cross SSRs. Switching
 only at the AC zero crossing eliminates the inrush/EMI of phase-angle control.
 Power is modulated by choosing *which* mains half-cycles to pass — a duty cycle
-in `[0, 1]`. A sigma-delta modulator (below) spreads the fired cycles out evenly
+in `[0, 1]`. A sigma-delta modulator (§2.3) spreads the fired cycles out evenly
 so the average power tracks the command with minimal low-frequency flicker.
+
+### Why watts, not duty?
+
+The control law works in **watts**: the PID outputs a total power demand, and a
+splitter turns watts into per-element duties using the configured element
+ratings. This makes the tuned gains independent of which elements are fitted —
+swap elements, update `bibby.ini`, and the loop still commands the same power
+per degree of error. It also enables the equal-flux split and anti-scorch cap
+(§2.4), which need to know real watts per cm².
 
 ---
 
 ## 2. Software architecture
 
-### 2.1 Shared memory — `shared/shm_types.h`
+### 2.1 Shared state — `src/state.{h,c}`
 
-A single `HeaterShm` struct mapped by both processes. Every field is a C11/C++
-`atomic` so the two processes can read and write without locks. The segment is
-created by the heater-controller (`O_CREAT`) and is **never** `shm_unlink`ed, so
-a restarted controller reattaches to the same segment instead of silently
-creating a new, separate one.
+`BibbyState` is a single struct of C11 atomics shared by the three threads —
+no locks on the hot paths. Key fields:
 
-| Field | Writer | Type | Purpose |
-|---|---|---|---|
-| `duty1`, `duty2` | frontend | float [0,1] | SSR1 / SSR2 duty cycles |
-| `simulate_zc` | frontend | bool | fake zero crossings for bench testing |
-| `frontend_iteration` | frontend | uint32 | incremented each UI frame; a heartbeat |
-| `output1`, `output2` | heater-controller | bool | current fired state of each SSR |
-| `watchdog_alarm` | heater-controller | bool | set when no ZC seen within timeout |
-| `iteration` | heater-controller | uint32 | ZC counter; the frontend uses it to detect a live controller |
+| Field | Writer | Purpose |
+|---|---|---|
+| `duty1`, `duty2` | sampler | per-element duty commands in `[0,1]` |
+| `p_demand_w`, `p_delivered_w` | sampler | commanded and measured average power |
+| `temp_raw_c`, `temp_filt_c`, `temp_valid` | sampler | latest sensor sample and validity |
+| `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in`, `simulate_zc` | UI | user intent |
+| `output1`, `output2`, `zc_count`, `watchdog_alarm` | SSR thread | fired state, ZC counter, ZC watchdog |
+| `control_heartbeat` | sampler | bumped every loop pass; the SSR thread's staleness watchdog watches it |
+| `rtd_fault`, `rtd_unresponsive`, `fault_forced_manual` | sampler | sensor-fault state |
+| `mc_est_j_per_c`, `adaptive_scale` | sampler | thermal-mass estimate and gain scale |
+| `running` | main | global shutdown flag |
 
-### 2.2 heater-controller (C) — `heater-controller/main.c`
+A mutex-guarded ring buffer of `HistPoint`s (one per 0.5 s) feeds the UI
+charts; it is the only locked structure, and only the UI and the sampler's
+0.5 s slow tick touch it.
 
-A single-threaded loop pinned to the AC mains zero crossing:
+### 2.2 Sampler thread — `src/sampler_thread.c`
 
-1. **Single instance.** `flock` on `/tmp/biab_heater.lock`; a second instance
-   exits immediately. The lock is released automatically by the kernel on exit
-   or crash.
-2. **Safe startup.** Open/create the shm segment and force `duty1=duty2=0`,
-   `output1=output2=false`, alarms cleared — so a restart never re-fires the
-   relays at a stale duty.
-3. **Zero-cross capture.** Wait for a rising edge on GPIO20 using libgpiod v2
-   edge events, with a timeout derived from the configured mains frequency (§7;
-   9.0 ms at 60 Hz, 10.7 ms at 50 Hz).
-4. **Sigma-delta modulation.** Each zero crossing, add the duty fraction to a
-   per-channel accumulator; when it reaches 1.0, fire that SSR for the half
-   cycle and subtract 1.0. The accumulator is capped at 2.0 to bound catch-up.
-   This is a first-order delta-sigma DAC clocked by the mains: the average fired
-   fraction equals the commanded duty, with the switching energy pushed to high
-   frequency.
-5. **Two watchdogs:**
-   - **Zero-cross watchdog:** if no ZC arrives within the timeout above, both
-     SSRs are forced off and `watchdog_alarm` is set (a lost mains-sense signal
-     must not leave a relay latched on). The timeout follows the configured
-     mains frequency automatically.
-   - **Frontend heartbeat watchdog:** if `frontend_iteration` does not advance
-     for `2 × mains_Hz` zero crossings (~2 s; 120 at 60 Hz, 100 at 50 Hz),
-     duties are forced to zero — a dead frontend must not leave the heaters
-     running.
-6. **Safe shutdown.** On SIGINT/SIGTERM, drive both SSRs low before exiting.
+Paced by the MAX31865 DRDY edge (one conversion per mains cycle, so ~60 Hz):
 
-`simulate_zc` lets the frontend (via the "Test Touch" button) inject fake zero
-crossings so the UI and modulator can be exercised on the bench with no mains
-connected.
+1. **Wait** for a DRDY falling edge (500 ms timeout so a dead sensor cannot
+   stall the loop — the read also checks the DRDY level directly, so a missed
+   edge still yields the conversion).
+2. **Read** the sensor (§2.5); fresh samples go through the temperature filter
+   (§2.6) and into the shared state.
+3. **Mode interlock:** any RTD fault, unresponsive sensor, or invalid
+   temperature forces **manual mode at zero watts** — automatic control can
+   never command power on bad data.
+4. **Control law** (§2.4): manual watts pass straight through; in auto, the
+   watts-based PID runs once per fresh sample.
+5. **Power split** (§2.4) turns the demand into `duty1`/`duty2`.
+6. **Slow tick (0.5 s):** compute delivered power from the SSR thread's fired
+   counters, update the m·c estimator (§2.7), push a chart history point.
+7. **CSV logging** (§10): one row per fresh sample (or per 0.5 s during an
+   outage, so faults stay on disk).
 
-### 2.3 frontend (C++) — `frontend/main.cpp`
+### 2.3 SSR thread — `src/ssr_thread.c`, `src/sigma_delta.h`
 
-SDL3 + Dear ImGui on GLES3. Per-frame loop:
+Runs at `SCHED_FIFO` (real-time) priority, pinned to the AC zero crossing:
 
-1. **Ensure the controller is up.** On startup, probe the shm `iteration`
-   counter; if the segment is missing or the counter is not advancing, launch
-   the heater-controller (double-fork + `setsid` so it is reparented to init and
-   outlives the frontend), then wait for the segment to appear.
-2. **Read the sensor** (non-blocking; see §2.4). Fresh samples are smoothed and
-   pushed to the PID and the on-screen history graph.
-3. **Choose control mode:**
-   - **Manual:** the on-screen slider sets the duty for both SSRs.
-   - **Auto:** the PID output drives both SSRs.
-   - If the temperature is **not reliable** (any RTD fault), the code forces
-     manual mode so the PID can never command power on bad data.
-4. **Publish** `duty1`, `duty2`, `simulate_zc`, and bump `frontend_iteration`.
-5. **Log** one CSV row per fresh sample (§10).
+1. **Zero-cross capture.** Wait for a rising edge on GPIO20 (libgpiod v2 edge
+   events) with a mains-derived timeout: half-period + 0.7 ms guard — 9.0 ms at
+   60 Hz, 10.7 ms at 50 Hz.
+2. **Sigma-delta modulation.** Each zero crossing, add each element's duty
+   fraction to a per-channel accumulator; fire that SSR for the half-cycle when
+   the accumulator reaches 1.0 and subtract 1.0. The accumulator is capped at
+   2.0 to bound catch-up after forced-off stretches. This is a first-order
+   delta-sigma DAC clocked by the mains: the average fired fraction equals the
+   commanded duty with the switching energy pushed to high frequency.
+3. **Zero-cross watchdog.** No edge within the timeout → both SSRs forced off,
+   `watchdog_alarm` set. A lost mains-sense signal must not leave a relay
+   latched on. `simulate_zc` (the UI's "ZC Sim" toggle) substitutes the timeout
+   tick for the edge so the modulator can be exercised with no mains connected.
+4. **Control-staleness watchdog.** The sampler bumps `control_heartbeat` every
+   pass; if it stops advancing for ~2 s worth of zero crossings
+   (`2 × mains_Hz`), duties are forced to zero — a wedged control loop must not
+   leave the heaters running. (`BIBBY_TEST_WEDGE=<sec>` wedges the sampler once,
+   5 s in, to demonstrate exactly this on the bench.)
+5. **Fired counters.** Per-element counts of fired half-cycles let the sampler
+   compute true delivered watts over each slow tick.
 
-#### Rotated display — `frontend/display.{h,cpp}`
+### 2.4 Control law — `src/control.c`, `src/power_split.c`
 
-The physical panel is mounted sideways. The UI is rendered into a
-**portrait-sized off-screen framebuffer**, then a fullscreen quad blits it to the
-landscape screen **rotated 90° CW** via a small GLSL shader. Touch coordinates
-are remapped through the same rotation before being fed to ImGui, so touches land
-where they appear.
+**PID (watts).** `p = kp·e`, integrator accumulates raw per-sample error
+(`ki` is W/°C per sample), derivative is a raw per-sample delta. Output is
+`clamp(ff + p + i + d, 0, max_power)` in watts. Anti-windup is **conditional
+integration**: the integrator holds whenever the non-integral output is already
+against a rail and the error would push further into it; a backstop clamps the
+integral term to full output authority (`max_power / ki`). No hand-tuned clamp
+constant exists — the bounds all derive from the configured elements.
 
-#### Temperature filter — `frontend/temp_filter.{h,cpp}`
+**Holding feedforward.** `ff = (setpoint − ambient_c) / process_gain_c` watts,
+clamped to `[0, max_power]` — the steady-state power needed to hold the
+setpoint, supplied directly so the integrator only trims model error (§9.6).
+Zero gain disables it.
 
-`SecondOrderAverage`: two cascaded boxcar (moving-average) stages — a
-second-order CIC with triangular weighting — over a 40-sample window. The first
-sample primes both stages so the output starts at the true value instead of
-ramping from zero.
+**Grain-in gain set.** The "Grain In" toggle swaps in an alternate gain set
+(`grain.kp/ki/kd`) and optionally caps power (`grain.max_power_w`) — the plant
+changes when grain is added, and scorch risk rises. Zero grain gains mean
+"same as main gains disabled" (auto commands no power in grain mode until they
+are set).
 
-#### PID controller — `frontend/pid.{h,cpp}`
+**Adaptive gain scaling** (config-gated, off by default). The m·c estimate
+(§2.7) divided by `adaptive.mc_ref_j_per_c` scales `kp`/`kd` within
+`[scale_min, scale_max]` — a half-size batch gets half the gain without
+retuning.
 
-`PidController::update(temp_c, setpoint_c, feedforward)` runs once per fresh
-sample and returns a power command `clamp(feedforward + p + i + d)` in `[0, 1]`.
-The full scaffolding is in place — per-sample execution, output clamp to
-`[0,1]`, conditional-integration anti-windup, and `reset()` — but the gains come
-from `bibby.ini` (§7) and **default to zero**, so the feedback commands zero
-power until the loop is tuned (see §9.5). The optional `feedforward` argument is
-the holding duty (§9.6); it defaults to zero. `terms()` exposes the
-feedforward / P / I / D breakdown and internal state for logging and tuning.
+**Equal-flux power split.** Demand is split so both elements run at the same
+surface power density (W/cm²): proportional to area, with saturation overflow
+pushed to the other element and everything clamped to the element ratings.
+With different elements (e.g. 5000 W/820 cm² + 5500 W/473 cm²) the duties are
+deliberately unequal — same flux, different power. `power.max_flux_w_cm2`
+optionally caps total demand at `flux × total_area` (anti-scorch; 0 disables).
 
-> Note: the loop currently treats one sample as one time step (`dt` folded into
-> the gains). If the sample cadence changes, make `dt` explicit.
-
-### 2.4 MAX31865 RTD sensor — `frontend/sensors/max31865.{h,cpp}`
+### 2.5 MAX31865 RTD sensor — `src/max31865.c`
 
 - PT100, **3-wire**, 400 Ω nominal reference resistor, on `/dev/spidev0.0` at
   1 MHz, `SPI_MODE_1`.
-- **Constructor sequence:** set 3-wire + clear faults + mains filter notch →
-  enable VBIAS (10 ms settle) → enable auto-conversion (20 ms) → discard the
-  first conversions using DRDY polling.
+- **Init sequence:** set 3-wire + clear faults + mains filter notch → enable
+  VBIAS (10 ms settle) → enable auto-conversion (20 ms) → discard the first 10
+  conversions using DRDY polling (they settle after VBIAS/auto enable).
 - **Mains filter:** config-register bit 0 selects the noise-rejection notch
-  (set = 50 Hz, clear = 60 Hz). It is set from `mains.frequency_hz` (§7) and
-  written in the first config word — before auto-conversion, as the datasheet
-  requires — so the sensor rejects local mains pickup.
-- **`read_temperature()` is non-blocking:** it checks the DRDY pin (GPIO16,
-  active-low). If a conversion is not ready it returns the previous value with
-  `is_fresh=false`; otherwise it burst-reads RTD + fault registers, converts via
-  the Callendar–Van Dusen equation, and applies the per-unit gain/offset
-  calibration (§9.2).
-- **Fault handling:** the RTD-LSB fault bit and the Fault Status register (07h)
-  are checked every read. A faulted conversion is rejected (the stale value is
-  held so the filter is not poisoned) and the fault latch is cleared so the
-  status reflects the next conversion. `decode_fault_status()` turns the register
-  into human-readable text shown on the UI.
+  (set = 50 Hz, clear = 60 Hz). It is set from `mains.frequency_hz` (§7) in the
+  first config word — before auto-conversion, as the datasheet requires.
+- **`max31865_read()` is non-blocking:** it checks the DRDY level (GPIO16,
+  active-low); not ready → previous value with `fresh=false`. Otherwise it
+  burst-reads RTD + fault registers in one SPI transaction, converts via
+  Callendar–Van Dusen, and applies the per-unit `Rref`/gain/offset calibration
+  (§9.1–9.2).
+- **Fault handling:** the RTD-LSB fault bit and Fault Status register are
+  checked every read. A faulted conversion is rejected (the stale value is held
+  so the filter is not poisoned) and the latch cleared so the status reflects
+  the next conversion. `max31865_fault_text()` decodes the register for the UI
+  fault band.
 
 The MAX31865 datasheet is included at [`docs/MAX31865.pdf`](docs/MAX31865.pdf).
+
+### 2.6 Temperature filter — `src/temp_filter.c`
+
+Cascaded boxcar (moving-average) stages — order and window from `bibby.ini`
+(default 2 × 40 samples ≈ a second-order CIC with triangular weighting, ~0.65 s
+group delay at 60 Hz). The first sample primes every stage so the output starts
+at the true temperature instead of ramping from zero.
+
+### 2.7 Thermal-mass estimator — `src/mc_estimator.c`
+
+During any stretch of roughly constant delivered power where the temperature
+rises ≥ 1 °C, the kettle behaves as an integrator: `dT/dt = P/(m·c)`. A
+least-squares slope over the stretch gives `m·c = P/slope` (water ≈ 4.186 kJ/°C
+per litre — the estimate is effectively the batch size). It is always computed
+and logged; feeding it back into the gains is the separate, config-gated
+adaptive scaling of §2.4.
+
+### 2.8 UI — `src/ui/`
+
+LVGL 9.3 rendering directly to the framebuffer:
+
+- **Display:** `lv_linux_fbdev` on `/dev/fb0`; the physical panel is portrait,
+  mounted sideways, so the UI renders 1280×720 and LVGL software-rotates 90°
+  into the 720×1280 framebuffer (`ui.rotation`). Touch comes from the first
+  evdev device advertising absolute multitouch (`ui.touch_device = auto`).
+- **Layout:** toggles (ZC Sim, Grain In, Manual Control) and ±10/±1/±0.1
+  setpoint steppers on top; temperature chart (setpoint, filtered, raw, grain
+  and mode-change markers) and power/PID-term chart below; vertical power
+  slider (manual watts in manual, live demand readout in auto); kettle graphic
+  whose element glow follows the commanded duties; fault band (decoded RTD
+  faults, watchdog, forced-manual notice); status line (m·c estimate and
+  adaptive scale).
+- LVGL is pinned to **v9.3.0**: v9.4 breaks the fbdev software-rotation path
+  and hangs in `lv_deinit` on shutdown.
+- The kernel console shares `/dev/fb0` and will draw its blinking cursor over
+  the UI; the systemd unit unbinds it (§5.3).
+
+`bibby --ui-test` shows a bring-up screen instead: border, corner labels, and a
+crosshair that follows the finger — verifies rotation and touch mapping before
+trusting the real UI.
 
 ---
 
@@ -221,18 +276,15 @@ This system switches mains voltage into multi-kilowatt heating elements, so the
 
 | Requirement | Mechanism |
 |---|---|
-| Heaters off on controller startup | shm duties forced to 0 before the relay loop starts |
-| Heaters off on controller exit/crash | SIGINT/SIGTERM handler drives SSRs low; `flock` released by kernel on crash |
-| Only one controller / one frontend at a time | `flock` single-instance locks (`shared/single_instance.h`) |
-| Heaters off if the mains-sense (ZC) signal is lost | mains-derived zero-cross watchdog (~9 ms at 60 Hz) forces SSRs off, raises `watchdog_alarm` |
-| Heaters off if the frontend stops servicing the loop | frontend heartbeat watchdog (~2 s) forces duties to zero |
-| The controller is always available to the frontend | frontend auto-launches the controller (detached) if it is not running |
-| No power commanded on unreliable temperature | an RTD fault forces manual mode; the PID path cannot drive the relays |
-| Duty commands always bounded | duties clamped to `[0,1]` in both processes |
-
-> The heater-controller is expected to also be started at boot by the operating
-> system; that is a deployment detail left to the integrator. The frontend's
-> auto-launch is a backstop, not the primary mechanism.
+| Heaters off at startup | SSR GPIO lines are requested with output value low before any thread runs |
+| Heaters off on exit/crash | the kernel releases the GPIO lines when the process dies — for any reason — and the SoC pull-downs hold the SSR inputs low; SIGINT/SIGTERM additionally shut down in order |
+| Only one instance | `flock` single-instance guard (`src/single_instance.h`); the kernel drops the lock on any exit |
+| Heaters off if mains-sense (ZC) is lost | mains-derived zero-cross watchdog (~9 ms at 60 Hz) forces SSRs off, raises `watchdog_alarm` |
+| Heaters off if the control loop wedges | control-staleness watchdog: sampler heartbeat stalled for ~2 s of ZCs → duties forced to zero |
+| GUI stalls cannot delay safety logic | the SSR thread runs `SCHED_FIFO`; the UI is not on the control path |
+| No power commanded on unreliable temperature | RTD fault / unresponsive sensor forces manual mode at zero watts; auto is unreachable until the sensor is healthy |
+| Power commands always bounded | demand clamped to the configured element ratings (and the optional flux cap) before splitting; duties clamped to `[0,1]` |
+| Controller returns after a crash | `Restart=always` in the systemd unit (§5.3); SSRs are safe during the gap per the kernel-release mechanism above |
 
 ---
 
@@ -243,15 +295,15 @@ This system switches mains voltage into multi-kilowatt heating elements, so the
 | Item | Notes |
 |---|---|
 | Raspberry Pi 5 | GPIO chip is `/dev/gpiochip4` on Pi 5 |
-| Touchscreen display | Mounted in portrait; software rotates the UI 90° CW |
+| Touchscreen display | 720×1280 DSI panel (Goodix touch), mounted sideways; UI software-rotates 90° |
 | PT100 RTD probe | 3-wire, immersed in the kettle |
 | 2 × zero-cross SSR | One per heating element; switched by GPIO21 / GPIO26 |
-| 2 × resistive heating element | Mains-powered, BIAB kettle |
+| 2 × resistive heating element | Mains-powered, BIAB kettle (this build: 5000 W and 5500 W) |
 | Custom Pi HAT PCB | Sensor front-end + zero-cross detector (§4.2) |
 
 > **TODO (fill in your build):** exact display model, SSR part numbers and
-> current rating, heating-element wattage, fusing/contactor, and mains
-> connector. These are deployment-specific and not captured in the repo.
+> current rating, fusing/contactor, and mains connector. These are
+> deployment-specific and not captured in the repo.
 
 ### 4.2 Raspberry Pi HAT PCB — `pi_hat/bibby_pi_hat/`
 
@@ -269,8 +321,8 @@ to view/edit the schematic and board, or to regenerate gerbers
 **AC zero-cross detector (U2 — H11AA1 AC-input optocoupler):**
 - The H11AA1 has an anti-parallel LED input, so it conducts on both mains
   half-cycles and its phototransistor output pulses around each zero crossing.
-- `R3`–`R6` = 43 kΩ, `R2` = 20 kΩ, `R7` = 1 MΩ (! DNI !) — line current-limiting and
-  pull/​bias network for the optocoupler. The pulse train feeds GPIO20.
+- `R3`–`R6` = 43 kΩ, `R2` = 20 kΩ, `R7` = 1 MΩ (! DNI !) — line current-limiting
+  and pull/bias network for the optocoupler. The pulse train feeds GPIO20.
 - Solder jumpers `JP1`/`JP2`/`JP3` select options on the board.
 
 **Connectors:**
@@ -291,10 +343,10 @@ to view/edit the schematic and board, or to regenerate gerbers
 | 21 | GPIO9 | SPI0 MISO | In | MAX31865 SDO |
 | 23 | GPIO11 | SPI0 SCLK | Out | MAX31865 CLK |
 | 24 | GPIO8 | SPI0 CE0 | Out | MAX31865 CS |
-| 36 | GPIO16 | DRDY | In | MAX31865 DRDY (frontend) |
-| 37 | GPIO26 | SSR2 | Out | heater-controller |
-| 38 | GPIO20 | Zero Cross | In | heater-controller |
-| 40 | GPIO21 | SSR1 | Out | heater-controller |
+| 36 | GPIO16 | DRDY | In | MAX31865 DRDY (sampler thread) |
+| 37 | GPIO26 | SSR2 | Out | SSR thread |
+| 38 | GPIO20 | Zero Cross | In | SSR thread |
+| 40 | GPIO21 | SSR1 | Out | SSR thread |
 
 ### 4.4 Electrical / wiring overview
 
@@ -314,17 +366,17 @@ to view/edit the schematic and board, or to regenerate gerbers
    PT100 RTD --3 wires--> MAX31865 (U1) --SPI0 + DRDY--> Pi
 ```
 
-- The H11AA1 provides **galvanic isolation** between the mains line-sense and the
-  Pi logic.
+- The H11AA1 provides **galvanic isolation** between the mains line-sense and
+  the Pi logic.
 - The SSRs are driven by 3.3 V GPIO on their input side; their output side
   switches mains into the elements.
-- The RTD is a low-voltage measurement isolated from the mains by the kettle and
-  the sensor front-end.
+- The RTD is a low-voltage measurement isolated from the mains by the kettle
+  and the sensor front-end.
 
 > **WARNING:** mains wiring, fusing, grounding/earth bonding, and enclosure
 > safety are the integrator's responsibility. Use appropriately rated SSRs and
-> heat-sinking, a proper earth connection to the kettle, and a contactor/fuse/breaker
-> sized to the elements.
+> heat-sinking, a proper earth connection to the kettle, and a
+> contactor/fuse/breaker sized to the elements.
 
 ### 4.5 Enclosure
 
@@ -340,217 +392,168 @@ Tested target: **Raspberry Pi 5**, 64-bit Raspberry Pi OS.
 
 ### 5.1 OS and interfaces
 
-1. Flash Raspberry Pi OS (64-bit) and boot the Pi. Install a beefy SD card (or other) for logging. Find a way to remote login to the pi.
+1. Flash Raspberry Pi OS (64-bit) and boot the Pi. Install a beefy SD card (or
+   other storage) for logging. Find a way to remote-login to the Pi.
 2. Enable SPI:
    ```
    sudo raspi-config   # Interface Options -> SPI -> Enable
    ```
    Confirm `/dev/spidev0.0` exists after reboot.
-   
-   The Pi 5 exposes GPIO via `/dev/gpiochip4`; both programs open it directly.
-   The user running the binaries must have access to the GPIO and SPI devices
-   (the `gpio` and `spi` groups, or run via a systemd unit with the right
-   permissions).
+3. The DSI touch display is auto-detected (`display_auto_detect=1` in
+   `/boot/firmware/config.txt`). The touch controller registers as a Goodix
+   evdev device; bibby finds it automatically.
+4. The Pi 5 exposes GPIO via `/dev/gpiochip4`; the code opens it directly. The
+   user running bibby needs the `gpio`, `spi`, `video`, and `input` groups (or
+   run via the systemd unit, §5.3).
 
 ### 5.2 Build dependencies
 
 ```
 sudo apt update
-sudo apt install -y build-essential cmake git \
-                    libgpiod-dev \
-                    libgles2-mesa-dev \
-                    libgl1-mesa-dev
+sudo apt install -y build-essential cmake git libgpiod-dev
 ```
 
-- **libgpiod v2** is required (the code uses the v2 edge-event API). Confirm with
-  `gpiodetect` / `pkg-config --modversion libgpiod`.
-- **SDL3** is fetched and built from source by CMake (FetchContent), so it does
-  not need to be installed. Its build may pull additional dev packages
-  (e.g. `libinput`, `libudev`, X/Wayland or KMS/DRM headers) depending on how
-  you run the display; install what SDL's configure step reports as missing.
+- **libgpiod v2** is required (the code uses the v2 edge-event API). Confirm
+  with `gpiodetect` / `pkg-config --modversion libgpiod`.
+- **LVGL** is fetched and built from source by CMake (FetchContent) — nothing
+  to install. It renders straight to the framebuffer; no X, Wayland, or GL
+  stack is needed.
+- The analysis tools (§9.4) additionally want
+  `pip3 install numpy scipy matplotlib pandas` on whatever machine runs them.
 
 ### 5.3 Autostart at boot (systemd)
 
-The frontend is the only process that needs to be started — it auto-launches
-the heater-controller if it is not already running. Create a systemd service
-to bring up the frontend on boot.
+[`deploy/bibby.service`](deploy/bibby.service) is the reference unit. Besides
+starting bibby it handles three things the app cannot do for itself:
 
-Create `/etc/systemd/system/bibby.service`:
+- **Unbinds the kernel console from the framebuffer** (`vtcon1`) before start —
+  otherwise the console's blinking cursor (and any kernel message) draws over
+  the UI — and rebinds it on stop.
+- **`LimitMEMLOCK=64M`** so `mlockall(MCL_CURRENT)` succeeds (the default 8 MB
+  is too small once LVGL is linked in).
+- **`AmbientCapabilities=CAP_SYS_NICE`** so the SSR thread gets its `SCHED_FIFO`
+  real-time priority without running the whole process as root.
 
-```ini
-[Unit]
-Description=bibby brew controller frontend
-After=multi-user.target
-
-[Service]
-User=ramp
-SupplementaryGroups=gpio spi video render input
-Environment=BIBBY_CONFIG=/home/ramp/bibby/bibby.ini
-ExecStart=/home/ramp/bibby/build/frontend/frontend
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Adjust `User` and `ExecStart` to match your username and the actual path to
-the built binary (see §6). Enable and start it:
+Install:
 
 ```
+sudo cp deploy/bibby.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable bibby
-sudo systemctl start bibby
+sudo systemctl enable --now bibby
 ```
 
-Check status and logs with:
-
-```
-systemctl status bibby
-journalctl -u bibby -f
-```
-
-The heater-controller inherits the service's group membership, so it also
-has the GPIO access it needs. If either process is killed, the heater-controller
-always drives the SSRs low before exiting; the frontend's watchdog in shared
-memory likewise forces duty to zero if the frontend stops updating.
+Check status and logs with `systemctl status bibby` / `journalctl -u bibby -f`.
+Adjust `User=` and the paths in the unit for your username/checkout. The unit
+uses `Restart=always`: the controller comes back if it ever dies, and the SSRs
+are safe during the gap (§3).
 
 ---
 
 ## 6. Building bibby
 
-Clone the repository first:
-
 ```
-git clone --recurse-submodules <repo-url> bibby
+git clone <repo-url> bibby
 cd bibby
-# if you already cloned without submodules:
-git submodule update --init --recursive
-```
-
-Dear ImGui is vendored as the `third_party/imgui` submodule.
-
-Standard CMake out-of-source build:
-
-```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-This produces two binaries:
+The first configure fetches LVGL (pinned to v9.3.0 — see §2.8) from GitHub.
+Two binaries result:
 
-- `build/heater-controller/heater-controller`
-- `build/frontend/frontend`
+- `build/bibby` — the controller (links `lvgl`, `gpiod`, `m`, `pthread`, `rt`)
+- `build/tests` — unit tests for the pure modules (no hardware needed):
 
-Notes:
+```
+./build/tests
+```
 
-- The frontend links `SDL3-static`, `GLESv2`, `gpiod`, and `rt`. The
-  heater-controller links `gpiod` and `rt`.
-- The frontend embeds the build-tree path of the heater-controller binary
-  (`BIBBY_PATH`) so it can auto-launch the freshly built controller
-  during development. **This path is not yet relocatable** — there is no
-  `make install` rule, and the path would need to be switched to runtime
-  resolution before installing to a target. `build/` and `logs/` are gitignored.
+`build/` and `logs/` are gitignored. There is no install step yet; run from the
+build tree (the systemd unit does the same). The config file is found relative
+to the executable (§7), so a copied-out binary works if `bibby.ini` sits next
+to it.
 
 ---
 
 ## 7. Configuration
 
 Runtime parameters that depend on the install (mains region, heating elements,
-control gains) live in **`bibby.ini`** at the repo root, **not** in the source.
-Both processes read the same file on startup, so a new brew setup is adapted by
-editing one file — no rebuild required.
+control gains, calibration) live in **`bibby.ini`**, **not** in the source.
+There is no reason to edit a constant in code and rebuild to adapt a new brew
+setup.
 
-```ini
-[mains]
-frequency_hz = 60        ; 60 = North America, 50 = most elsewhere
+**Lookup order:** `-c <path>` argument → `$BIBBY_CONFIG` environment variable →
+`bibby.ini` next to the executable → `bibby.ini` in the current directory.
+A missing file or unknown key falls back to a built-in safe default (60 Hz,
+zero gains), so the system still comes up. Comments (`#` or `;`, inline
+allowed) and blank lines are ignored.
 
-[element1]               ; SSR1, GPIO21 / pin 40
-watts    = 2500          ; rated electrical power, W
-area_cm2 = 150           ; wetted surface area, cm^2
+All keys, with their defaults:
 
-[element2]               ; SSR2, GPIO26 / pin 37
-watts    = 2500
-area_cm2 = 150
-
-[pid]                    ; temperature-loop gains; output is duty in [0,1]
-kp = 0.0
-ki = 0.0
-kd = 0.0
-
-[feedforward]            ; holding-duty feedforward (§9.6); 0 gain = disabled
-process_gain_c = 0.0     ; identified process gain K, °C per unit duty (§9.4)
-ambient_c      = 20.0    ; cold-start / room reference temperature, °C
-
-[sensor]                 ; per-unit RTD calibration (re-derive per probe, §9)
-ref_resistor_ohms = 397.82   ; MAX31865 Rref, ice-point trimmed (§9.1)
-temp_cal_gain     = 1.0528   ; two-point span gain  (§9.2)
-temp_cal_offset   = -0.032   ; two-point span offset, °C (§9.2)
-```
-
-How it is loaded (`shared/config.{h,c}`, compiled into both binaries):
-
-- **Lookup order:** the `$BIBBY_CONFIG` environment variable, then the
-  compile-time default (the `BIBBY_CONFIG` define, the source-tree `bibby.ini`).
-  Set `$BIBBY_CONFIG` to point a deployed binary at an installed config. (The
-  env var and the compile-time default deliberately share the `BIBBY_CONFIG`
-  name.)
-- **Robust by default:** a missing file or unknown key falls back to a built-in
-  default (60 Hz, zero PID gains), so the system still comes up safely. Comments
-  (`#` or `;`, inline allowed) and blank lines are ignored.
-
-What each parameter drives:
-
-| Key | Used by | Effect |
+| Key | Default | Effect |
 |---|---|---|
-| `mains.frequency_hz` | both | heater-controller: zero-cross watchdog timeout = mains half-period + 0.7 ms guard (60 Hz → 9.0 ms, 50 Hz → 10.7 ms), and the frontend-stale cutoff (`2 × Hz` ≈ 2 s of zero crossings). frontend: selects the MAX31865 noise-rejection filter notch (50/60 Hz) written at sensor startup. |
-| `pid.kp` / `ki` / `kd` | frontend | PID gains handed to the controller at construction (§9.5). |
-| `feedforward.process_gain_c` / `ambient_c` | frontend | Holding-feedforward gain and reference; `u_ff = (setpoint − ambient_c)/process_gain_c`. A zero gain disables feedforward (§9.6). |
-| `sensor.ref_resistor_ohms` | frontend | MAX31865 reference resistor `Rref`, trimmed at the ice point; scales the RTD resistance reading (§9.1). |
-| `sensor.temp_cal_gain` / `temp_cal_offset` | frontend | Two-point span correction applied to the temperature, `T_true = gain·T + offset` (§9.2). |
-| `element*.watts` / `area_cm2` | frontend | Loaded into the config struct; reserved for the planned watts→duty / power-density control law — not yet consumed by the loop. |
+| `mains.frequency_hz` | 60 | ZC watchdog timeout (half-period + 0.7 ms), staleness cutoff (2×Hz ZCs ≈ 2 s), MAX31865 notch (50/60 Hz) |
+| `element1.watts` / `element2.watts` | 2500 / 2500 | element ratings; their sum is the maximum power demand |
+| `element1.area_cm2` / `element2.area_cm2` | 150 / 150 | wetted areas driving the equal-flux split |
+| `power.max_flux_w_cm2` | 0 (off) | anti-scorch cap: total demand ≤ flux × total area |
+| `pid.kp` / `ki` / `kd` | 0 | watts-based gains (§9.5); zero = auto commands no power |
+| `grain.kp` / `ki` / `kd` | 0 | alternate gain set while "Grain In" is on |
+| `grain.max_power_w` | 0 (off) | power cap while grain is in |
+| `feedforward.process_gain_c` | 0 (off) | identified K [°C/W]; holding feedforward `(setpoint−ambient)/K` watts |
+| `feedforward.ambient_c` | 20 | feedforward reference temperature |
+| `sensor.ref_resistor_ohms` | 400 | MAX31865 Rref, ice-point trimmed (§9.1) |
+| `sensor.temp_cal_gain` / `temp_cal_offset` | 1.0 / 0.0 | two-point span trim, `T_true = g·T + b` (§9.2) |
+| `filter.order` / `filter.window` | 2 / 40 | boxcar cascade stages and window length (§2.6) |
+| `logging.rate` | high | `high` = row per sample (60 Hz); `low` = row per `low_period_s` |
+| `logging.low_period_s` | 2.0 | row period in low-rate mode |
+| `ui.show_zc_sim` | true | show the bench-test ZC Sim toggle (hide for a production panel) |
+| `ui.chart_window_min` | 5 | chart time window, minutes (1–30) |
+| `ui.rotation` | 90 | UI rotation onto the panel: 0/90/180/270 |
+| `ui.fb_device` / `ui.touch_device` | auto | `auto` = `/dev/fb0` / first multitouch evdev; or explicit paths |
+| `adaptive.enable` | false | scale kp/kd by (m·c estimate / `mc_ref_j_per_c`) |
+| `adaptive.mc_ref_j_per_c` | 0 | m·c the gains were tuned at |
+| `adaptive.scale_min` / `scale_max` | 0.5 / 4.0 | clamp on the adaptive scale |
 
-> Every per-unit calibration constant lives in `bibby.ini`; none require a code
-> change or rebuild. Identity defaults (`Rref` = 400 Ω, gain = 1.0, offset = 0.0)
-> leave the sensor uncalibrated but functional. Each value's derivation formula
-> is in §9.
-
-> Because the default path is baked to the source tree (like the other
-> build-tree paths, §6), packaging for a target should set `$BIBBY_CONFIG` or
-> rebuild with the `BIBBY_CONFIG` define pointed at the installed location.
+The shipped `bibby.ini` documents each value's derivation inline; §9 gives the
+full procedures.
 
 ---
 
 ## 8. Running
 
-The frontend will start the controller for you:
-
 ```
-./build/frontend/frontend
-```
-
-On launch it checks whether a live heater-controller is present (via the shm
-`iteration` heartbeat) and spawns one detached if not. To run the controller on
-its own (e.g. for a boot-time service):
-
-```
-./build/heater-controller/heater-controller
+./build/bibby                  # the normal touch UI
+./build/bibby --ui-test        # display/touch bring-up screen (§2.8)
+./build/bibby --headless       # no display: prints a status line every 2 s
+./build/bibby --sim-zc         # start with simulated zero crossings (bench)
+./build/bibby --manual-w 2000  # start in manual at 2000 W (step tests)
+./build/bibby -c /path/to.ini  # explicit config
 ```
 
-**Bench testing without mains:** press **Test Touch** in the UI to set
-`simulate_zc`, which makes the controller treat its mains-derived timeout (§7)
-as a zero crossing. The sigma-delta modulator and UI then run with no AC connected.
+If the framebuffer cannot be opened the UI falls back to headless mode rather
+than exiting — the controller and safety logic keep running.
 
 ### UI elements
 
-- Large kettle readout: set point (°C), measured °C and °F, animated heating
-  elements whose glow tracks the SSR fired state.
-- Full-height **duty slider** (active in manual mode; commands both SSRs).
-- **Set-point steppers:** ±10 / ±1 / ±0.1 °C.
-- **Toggles:** Test Touch (simulate ZC), Grain In (logged event marker), Manual
-  Control (manual vs PID auto).
-- **Temperature graph:** last 3 minutes.
-- **Fault band:** RTD fault (decoded) and watchdog alarm, when active.
+- **Kettle card:** setpoint, measured °C and °F, animated elements whose glow
+  tracks the commanded duty, per-element duty readout (`E1 x%  E2 y%` — these
+  differ by design; see the equal-flux split, §2.4).
+- **POWER slider:** commands watts in manual mode; shows the loop's live demand
+  in auto (disabled for input). Total watts read out under it.
+- **Setpoint steppers:** ±10 / ±1 / ±0.1 °C.
+- **Toggles:** ZC Sim (simulate zero crossings — bench only), Grain In (gain
+  set swap + logged event marker), Manual Control (manual watts vs PID auto).
+- **Charts:** temperature (setpoint / filtered / raw + grain and mode-change
+  markers) and power (demand W / delivered / ff / P / I / D), window set by
+  `ui.chart_window_min`, y-autoscaled.
+- **Fault band:** decoded RTD faults, watchdog alarm, and "Auto disabled →
+  manual" when a fault forced the mode switch.
+- **Status line:** m·c estimate (≈ batch size) and adaptive gain scale.
+
+**Bench testing without mains:** toggle **ZC Sim** (or start with `--sim-zc`).
+The SSR thread then clocks the sigma-delta from its timeout tick instead of the
+missing zero-cross edge; the full UI, control law, and logging run with no AC
+connected.
 
 ---
 
@@ -561,7 +564,15 @@ specific RTD probe and the board's reference resistor, so they **must be
 re-derived for any other board or probe**. All three live in the `[sensor]`
 section of `bibby.ini`; **none require a code change or rebuild**. Their
 identity defaults (`Rref` = 400 Ω, gain = 1.0, offset = 0.0) give a working but
-uncalibrated sensor. The procedure below derives them from physical references.
+uncalibrated sensor.
+
+`tools/calibrate_sensor.py` does the §9.1/§9.2 arithmetic for you (standard
+library only):
+
+```
+python3 tools/calibrate_sensor.py rref --ice-reading 1.4 --rref-current 400
+python3 tools/calibrate_sensor.py span --p1 0.0 0.0 --p2 25.0 23.78
+```
 
 | `bibby.ini` key | Symbol | What it corrects |
 |---|---|---|
@@ -572,7 +583,7 @@ uncalibrated sensor. The procedure below derives them from physical references.
 The driver applies them in this order, so **calibrate in this order too**:
 
 ```
-R_rtd  = (raw / 32768) * Rref           # ref_resistor_ohms  (§9.1)
+R_rtd  = (raw / 32768) * Rref            # ref_resistor_ohms  (§9.1)
 T_cvd  = CVD(R_rtd)                      # Callendar–Van Dusen, fixed
 T_true = g * T_cvd + b                   # gain, offset       (§9.2)
 ```
@@ -585,12 +596,12 @@ cheapest 0 °C reference available).
 
 **Procedure**
 
-1. Set `sensor.temp_cal_gain = 1.0`, `sensor.temp_cal_offset = 0.0` (so the span
-   trim does not mask the reading), and `sensor.ref_resistor_ohms` to the board's
-   nominal reference (400 Ω here — the value of `R1` on the HAT, §4.2).
+1. Set `sensor.temp_cal_gain = 1.0`, `sensor.temp_cal_offset = 0.0` (so the
+   span trim does not mask the reading), and `sensor.ref_resistor_ohms` to the
+   board's nominal reference (400 Ω here — the value of `R1` on the HAT, §4.2).
 2. Submerge the probe in a well-stirred ice-water bath and let it settle.
-3. Read the measured temperature `T_ice` (the **raw** column in the CSV log, §10,
-   before any span trim).
+3. Read the measured temperature `T_ice` (the **raw** column in the CSV log,
+   §10, before any span trim).
 4. The PT100 resistance the probe *should* present at `T_ice` is, from
    Callendar–Van Dusen with `R0 = 100 Ω`, `A = 3.9083e-3`:
    `R_pt100(T) = 100·(1 + A·T + B·T²)`, which near 0 °C is ≈ `100·(1 + A·T)`.
@@ -618,39 +629,39 @@ offset =  T1_ref - gain · T1_meas
 ```
 
 Pick the two points as far apart as practical and bracketing the brew range for
-the best fit. Good choices: the ice point (0 °C) and the local **boiling point**
-(altitude-corrected, below). A stirred ambient bath against a trusted reference
-thermometer also works for the upper point.
+the best fit. Good choices: the ice point (0 °C) and the local **boiling
+point** (altitude-corrected, below). A stirred ambient bath against a trusted
+reference thermometer also works for the upper point.
 
 **Boiling-point reference.** Water boils below 100 °C at altitude; approximate
-the local boiling point as `T_boil ≈ 100 − 3.4·(h/1000m)` (°C, `h` = elevation),
-or read it from a steam table for your barometric pressure, then use that as the
-upper `T_ref`.
+the local boiling point as `T_boil ≈ 100 − 3.4·(h/1000m)` (°C, `h` =
+elevation), or read it from a steam table for your barometric pressure, then
+use that as the upper `T_ref`.
 
-**Worked example (this unit):** ice point `(0.00, 0.00)` and a fan-mixed ambient
-point `(25.00, 23.78)`:
+**Worked example (this unit):** ice point `(0.00, 0.00)` and a fan-mixed
+ambient point `(25.00, 23.78)`:
 `gain = (25.00 − 0.00)/(23.78 − 0.00) = 1.0513`,
-`offset = 0.00 − 1.0513·0.00 = 0.0`. After a small refinement the shipped values
-are `sensor.temp_cal_gain = 1.0528`, `sensor.temp_cal_offset = -0.032`.
+`offset = 0.00 − 1.0513·0.00 = 0.0`. After a small refinement the shipped
+values are `sensor.temp_cal_gain = 1.0528`, `sensor.temp_cal_offset = -0.032`.
 
 > **PROVISIONAL:** both points above are ≤ 25 °C. Re-fit using a boiling-point
-> upper reference before trusting brew-range temperatures — at 5230 ft the local
-> boiling point is **94.7 °C**, and the §9.1-trimmed RTD should read ~90.0 °C
-> there. Re-derive both keys for your own probe and altitude.
+> upper reference before trusting brew-range temperatures — at 5230 ft the
+> local boiling point is **94.7 °C**, and the §9.1-trimmed RTD should read
+> ~90.0 °C there. Re-derive both keys for your own probe and altitude.
 
 ### 9.3 Process model
 
-The Laplace-domain model of the signal chain from duty command to measured
-temperature has three cascaded stages: the kettle thermal plant, the RTD probe
-lag, and the software filter.
+The model of the signal chain from power command to measured temperature has
+three cascaded stages: the kettle thermal plant, the RTD probe lag, and the
+software filter.
 
 #### Signal chain
 
 ```
-  u ──►[ ×P_max ]──► P ──►[ G_plant ]──► T_kettle ──►[ G_probe ]──►[ G_filt ]──► T_meas ──► PID
- (duty)    [W]            K_p/(τ_p s+1)              1/(τ_pr s+1)   2× N-boxcar
+  P [W] ──►[ G_plant ]──► T_kettle ──►[ G_probe ]──►[ G_filt ]──► T_meas ──► PID
+            K/(τs+1)                  1/(τ_pr s+1)   boxcar cascade
 
-           plant heat loss: T_kettle relaxes toward ambient T_amb at rate h·(T_kettle−T_amb)
+  plant heat loss: T_kettle relaxes toward ambient at rate k_loss·(T − T_amb)
 ```
 
 #### Kettle thermal plant
@@ -659,347 +670,235 @@ Energy balance of a well-stirred (recirculated) kettle, linearised about an
 operating point:
 
 ```
-m · c_p · dT/dt = P_in − h · (T − T_amb)
+m · c_p · dT/dt = P − k_loss · (T − T_amb)
 
-G_plant(s) = T(s)/P(s) = K_plant / (τ_plant · s + 1)
+G_plant(s) = T(s)/P(s) = K / (τ · s + 1)
 
-  K_plant   = 1/h              [°C/W]    steady-state gain
-  τ_plant   = m · c_p / h     [s]       dominant time constant
+  K       = 1/k_loss        [°C/W]   steady-state gain
+  τ       = m·c_p / k_loss  [s]      dominant time constant
 
-  m         liquid mass, kg
-  c_p       4 186 J/(kg·°C)  for water
-  h         total heat-loss coefficient, W/°C
-            (conduction through walls + lid, radiation, evaporation)
+  m       liquid mass, kg
+  c_p     4186 J/(kg·°C) for water
+  k_loss  total heat-loss coefficient, W/°C
+          (conduction through walls + lid, radiation, evaporation)
 ```
 
-For a 30 L batch in a reasonably insulated kettle `τ_plant` is typically
-**20–40 minutes**.  The heat-loss coefficient `h` is small, making `K_plant`
-large; their ratio `P_max / (m · c_p)` is the initial ramp rate at full power
-and is easy to measure directly from the step test.
+For a 30 L batch in a reasonably insulated kettle τ is typically **20–40
+minutes**. The initial ramp rate at power `P` is `P/(m·c_p)` — easy to check
+directly against the step test, and the basis of the online m·c estimator
+(§2.7).
 
 #### RTD probe lag
 
-The PT100 probe has its own thermal mass that causes a first-order lag before
-it reaches the liquid temperature:
+The PT100 probe has its own thermal mass causing a first-order lag:
 
 ```
-G_probe(s) = 1 / (τ_probe · s + 1)
-
-  τ_probe ≈ 5–30 s   (depends on probe mass, immersion depth, flow past tip)
+G_probe(s) = 1 / (τ_probe · s + 1),   τ_probe ≈ 5–30 s
 ```
 
 #### Software filter
 
-The `SecondOrderAverage` filter consists of two cascaded N = 40 sample
-boxcar stages running at the MAX31865 continuous-conversion rate `f_s`
-(≈ 60 Hz / 16.7 ms at the 60 Hz notch, 50 Hz / 20 ms at the 50 Hz notch — one
-sample per mains cycle).  Each boxcar introduces a group delay of
-`(N−1)/(2·f_s) ≈ 0.33 s`, so the two stages together add approximately:
+The default filter is two cascaded N = 40 boxcars at the sensor rate
+`f_s` (≈ 60 Hz — one conversion per mains cycle). Each boxcar contributes
+`(N−1)/(2·f_s) ≈ 0.33 s` of group delay; both together ≈ 0.65 s, absorbed into
+the dead time below.
 
-```
-Total filter group delay ≈ N / f_s ≈ 0.65 s   (at 60 Hz notch, N = 40)
-```
-
-For controller design the filter is approximated as a pure lag equal to its
-group delay, absorbed into the effective dead time `L` below.
-
-#### Combined open-loop transfer function
-
-Duty command to measured temperature:
-
-```
-G(s) = P_max · G_plant(s) · G_probe(s) · G_filt(s)
-
-     = K_total / ((τ_plant·s+1) · (τ_probe·s+1) · (τ_filt·s+1)²)
-
-  K_total = P_max / h = (watts1 + watts2) / h   [°C per unit duty]
-```
-
-Because `τ_plant` dominates, the higher-order poles (probe, filter) are
-absorbed into an effective dead time to give the **First-Order Plus Dead Time
-(FOPDT) approximation** used for tuning:
+#### Combined FOPDT approximation
 
 ```
 G_FOPDT(s) = K · e^(−L·s) / (τ · s + 1)
 
-  K   ≈ K_total = (watts1 + watts2) / h     [°C / unit duty]
-  τ   ≈ τ_plant                             [s]   dominant time constant
-  L   ≈ τ_probe + N / f_s                   [s]   effective dead time
+  K   ≈ 1/k_loss                [°C/W]
+  τ   ≈ m·c_p / k_loss          [s]
+  L   ≈ τ_probe + filter delay  [s]
 ```
 
-The ratio `L/τ` characterises controllability: `L/τ < 0.3` is straightforward
-to control; values above 1.0 indicate a sluggish, delay-dominated plant.  For
-a typical BIAB kettle, `L/τ` is well below 0.05 — the dominant challenge is
-the large time constant, not the dead time.
+The ratio `L/τ` characterises controllability: `< 0.3` is straightforward;
+`> 1.0` is delay-dominated. A BIAB kettle sits well below 0.3 — the challenge
+is the large time constant, not the dead time.
 
 #### Gain conventions — continuous vs. INI
 
-The bibby PID accumulates raw error counts (`integral_ += error`, not
-`+= error·dt`) and computes raw deltas for the derivative (`deriv = e[n]−e[n−1]`,
-not divided by `dt`).  The INI gains therefore relate to continuous-time gains
-by:
+The PID accumulates raw error once per sample (`integral += e`, not `e·dt`)
+and uses raw per-sample deltas for the derivative. The INI gains relate to
+continuous-time gains by:
 
 ```
-kp_ini  = Kp_c                     (no scaling)
-ki_ini  = Ki_c · T_s               (T_s = sample period from CSV)
-kd_ini  = Kd_c / T_s
+kp_ini = Kp_c            [W/°C, unchanged]
+ki_ini = Ki_c · T_s      [T_s = sample period ≈ 1/60 s]
+kd_ini = Kd_c / T_s
 ```
 
-`T_s` is estimated automatically from the `t_monotonic_s` column of the log.
-
----
+`identify_plant.py` measures `T_s` from the log and folds it in automatically.
 
 ### 9.4 System identification
 
-The parameters `K`, `τ`, and `L` of the FOPDT model are obtained from an
-**open-loop step test**: drive a constant manual duty and record the filtered
-temperature response.  The Python script `tools/identify_plant.py` fits the
-model and computes PID gains automatically.
+`K`, `τ`, and `L` come from an **open-loop step test**: command constant watts
+in manual mode and record the temperature response.
+`tools/identify_plant.py` fits the model and prints ready-to-paste
+`[pid]`/`[feedforward]` blocks.
 
 #### Step-test procedure
 
-The test requires the kettle to be filled and recirculated, but the heater does
-not need to be at any particular starting temperature.
-
 1. **Fill** the kettle to the intended brew volume and start the recirculation
-   pump.  Good mixing is required for the lumped-thermal-mass model to hold.
-2. **Stabilise.** Let the temperature settle for a few minutes with manual duty
-   at 0 %.  Note the starting temperature.
-3. **Apply the step.** In the bibby UI:
-   - Switch to **Manual Control**.
-   - Set the duty slider to **30–50 %** (enough power to produce a clear signal
-     while staying well clear of boiling for at least 15 minutes).
-   - Leave the duty at that value for the duration of the test.
-4. **Log.** The CSV logger runs continuously.  Let the brew run until the
-   temperature has risen **15–25 °C** above the starting value, or for at least
-   **15 minutes** — whichever comes first.
-5. **End the test.** Return the duty slider to 0 and switch back to manual.
-   Note the wall-clock time so you can locate the step in the CSV log.
-6. **Copy the log** from `~/bibby/logs/YYYY/MM/DD/HH-MM-SS.csv` to your
-   analysis machine.
+   pump. Good mixing is required for the lumped-thermal-mass model to hold.
+2. **Stabilise.** Let the temperature settle a few minutes at 0 W.
+3. **Apply the step.** Manual Control on; set the power slider to **30–50 %**
+   of maximum (a clear signal, well clear of boiling for ≥ 15 min); leave it.
+   (`--manual-w` on the command line does the same from startup.)
+4. **Log.** The CSV logger runs continuously. Let it run until the temperature
+   has risen **15–25 °C**, or ≥ **15 minutes** — whichever comes first. Longer
+   is better: a test that approaches steady state pins down `K` and `τ`
+   individually, not just their ratio.
+5. **End.** Slider back to 0. Note the time to locate the step in the log.
+6. **Copy the log** from `~/bibby/logs/YYYY/MM/DD/HH-MM-SS.csv`.
 
-> **Practical notes:**
-> - Both SSRs are commanded by the same slider in manual mode, so the total
->   power step is `duty × (watts1 + watts2)`.
-> - A stable, calm starting temperature is important; avoid running the test
->   immediately after a previous heating phase.
-> - If the liquid reaches boiling during the test, stop immediately — the model
->   changes once evaporative cooling becomes significant.
+> If the liquid reaches boiling, stop — the model changes once evaporative
+> cooling is significant.
 
-#### Identifying the step window
-
-Open the CSV in a spreadsheet or text editor and note two timestamps from the
-`t_monotonic_s` column:
-
-| Landmark | How to find it |
-|---|---|
-| `t_start` | The sample just before the duty jumps from 0 to the step value |
-| `t_end`   | The last sample before you returned the duty to 0 |
-
-Pass these as `--t-start` and `--t-end` (both in seconds from the log start,
-i.e., `t_monotonic_s − t_monotonic_s[0]`).
-
-#### Running the identification script
+#### Running the identification
 
 ```
-# Install dependencies once
-pip3 install numpy scipy matplotlib pandas
+pip3 install numpy scipy matplotlib pandas    # once
 
-# Basic run (auto-detects duty from the log)
 python3 tools/identify_plant.py logs/YYYY/MM/DD/HH-MM-SS.csv \
-        --t-start 120 --t-end 1020
+        --t-start 120 --t-end 1020 -o step_fit.png
 
-# Specify duty explicitly (more reliable), with λ ≈ L for a moderately fast loop
-python3 tools/identify_plant.py logs/YYYY/MM/DD/HH-MM-SS.csv \
-        --t-start 120 --t-end 1020 --duty 0.40 --lambda 30
-
-# Save the plot to a file
-python3 tools/identify_plant.py logs/YYYY/MM/DD/HH-MM-SS.csv \
-        --t-start 120 --t-end 1020 --duty 0.40 -o step_fit.png
+# Specify the step power explicitly (otherwise the log median is used),
+# and λ for a more conservative IMC tuning:
+python3 tools/identify_plant.py logs/... --watts 4000 --lambda 60
 ```
 
-The script prints a summary and ready-to-paste `[pid]` and `[feedforward]`
-blocks (illustrative numbers below):
+`--t-start`/`--t-end` are seconds from the start of the log; trim the window
+to the step. Old duty-format logs (pre-rebuild) are converted with
+`--e1-watts`/`--e2-watts`.
 
-```
-── FOPDT model ────────────────────────────────────────────────
-  K   (process gain)  = 73.4  °C per unit duty
-  τ   (time constant) = 1823  s  (30.4 min)
-  L   (dead time)     = 28.6  s
-  L/τ (relative DT)   = 0.0157  (easy to control)
-  Fit RMSE            = 0.041  °C
-
-── bibby.ini gains  (dt = 16.7 ms, discrete, gains folded) ──
-
-  ── IMC-PI  (λ=30.0 s)
-  [pid]
-  kp = 0.423831
-  ki = 0.00000388
-  kd = 0.00000
-
-── bibby.ini feedforward  (holding-duty feedforward, README §9.6) ──
-  [feedforward]
-  process_gain_c = 73.40      # identified K, °C per unit duty
-  ambient_c      = 21.50      # window start temp; use cold-soak/room temp
-```
-
-The plot shows the measured temperature, the FOPDT fit, the duty trace, and
-the fit residuals — inspect the residuals to confirm the model fits well.
-
-#### What the model parameters tell you
+The script prints the FOPDT fit, a physical cross-check — `k_loss`, `m·c`
+(compare against the actual litres × 4.186 kJ/°C), and the °C/min ramp rate —
+tuned gains per rule, and the INI blocks. The plot shows the measured
+temperature, the fit, the power trace, and residuals; inspect the residuals to
+confirm the model fits.
 
 | Parameter | Physical meaning | Implication |
 |---|---|---|
-| `K` | Total power / heat-loss coefficient | Large K means the heater dominates; steady state is well above ambient |
-| `τ` | Thermal time constant of the full batch | Larger batch = larger τ; the loop can afford slower response |
-| `L` | Probe lag + filter delay | Limits how aggressively you can tune; keep the probe well-immersed |
-| `L/τ` | Relative dead time | < 0.1 is easy; > 0.5 requires careful detuning |
-
----
+| `K` | 1 / heat-loss coefficient | Large K: heater dominates; steady state far above ambient |
+| `τ` | Thermal time constant of the batch | Larger batch = larger τ; the loop can afford slower response |
+| `L` | Probe lag + filter delay | Limits tuning aggression; keep the probe well-immersed |
+| `L/τ` | Relative dead time | < 0.1 easy; > 0.5 requires careful detuning |
+| `m·c` | Batch thermal mass | Sanity check vs. litres; reference for adaptive scaling |
 
 ### 9.5 PID tuning
 
-The control law is in place but **un-tuned** — the default gains are zero, so
-auto mode commands zero power until you set `pid.kp/ki/kd` in `bibby.ini` (§7).
-
-#### Choosing a tuning rule
-
-The script offers three rules.  All are derived from the FOPDT model fit (§9.4):
+Auto mode commands zero power until `pid.kp/ki/kd` are set. The script offers
+three rules, all from the same fit:
 
 | Rule | Characteristic | When to use |
 |---|---|---|
-| **IMC-PI** | Smooth, no overshoot; λ sets the trade-off between speed and robustness | First choice for BIAB; tune λ to taste |
-| **ZN-PID** | Aggressive, ~25 % overshoot | Upper bound; useful to understand the fastest achievable loop |
-| **CC-PID** | Balanced, works well at moderate `L/τ` | Good sanity check against IMC |
+| **IMC-PI** | Smooth, no overshoot; λ sets speed vs. robustness | First choice for BIAB; tune λ to taste |
+| **ZN-PID** | Aggressive, ~25 % overshoot | Upper bound on aggressiveness only |
+| **CC-PID** | Balanced at moderate `L/τ` | Sanity check against IMC |
 
-For a mash process, **IMC-PI** with `λ ≈ L` (the dead time) is a good starting
-point.  Overshoot during a mash step costs enzyme activity, so err towards a
-larger λ (slower, more conservative).
+For a mash, **IMC-PI** with `λ ≈ L` is a good start. Overshoot costs enzyme
+activity — err toward larger λ. Keep `kd = 0`: at 60 Hz the raw per-sample
+derivative mostly amplifies sensor noise.
 
-```bash
-# Try IMC-PI with λ = 60 s (more conservative)
-python3 tools/identify_plant.py logs/... --rule imc --lambda 60
-```
+The shipped `bibby.ini` carries IMC-PI starting gains identified from this
+build's 2026-06-20 bench tests (~15 L, 5000+5500 W elements). **Validate on
+your own setup before trusting a batch:**
 
-#### Anti-windup
+1. Copy the printed `[pid]` (and `[feedforward]`, §9.6) blocks into
+   `bibby.ini` and restart bibby.
+2. Set a setpoint **5–10 °C above** current temperature, switch to **Auto**,
+   and watch the charts.
+3. A good response rises smoothly and settles with minimal overshoot. If it
+   oscillates, increase λ and re-run the script.
+4. Inspect the logged `pid_ff_w`/`pid_p_w`/`pid_i_w`/`pid_d_w` split: the
+   feedforward should carry the holding power, the integral only trim, the
+   derivative not chatter.
 
-The primary anti-windup is **conditional integration** (`pid.cpp`): the
-integrator is held whenever the commanded output is already against a rail
-(0 or 1) and the current error would push it further into that rail.  This keeps
-the integrator from winding up against a saturated output, and — once a holding
-feedforward is configured (§9.6) — confines it to the `[−u_ff, 1−u_ff]` band the
-feedforward leaves available.  A hard `±INTEGRAL_MAX` clamp (`pid.cpp`) is a
-secondary backstop.
+Anti-windup needs no configuration: conditional integration plus the
+`max_power/ki` backstop (§2.4) bound the integrator automatically.
 
-How much integral authority you need depends on whether you use feedforward:
+**Grain-in gains.** Adding grain changes the plant (more mass, worse mixing,
+scorch risk at the bag). Re-run the step test with grain in (or a sacrificial
+equivalent) to derive `grain.kp/ki/kd`, and consider `grain.max_power_w` to cap
+flux at the bag.
 
-- **With feedforward (§9.6):** the feedforward supplies the steady-state holding
-  power, so the integrator only trims model error.  A small authority is fine —
-  the script's low-authority message is informational in this case.
-- **Without feedforward:** the integrator must supply *all* the holding power, so
-  it needs real authority.  If the script reports `ki × INTEGRAL_MAX` below
-  ~10 %, raise `INTEGRAL_MAX` in `frontend/pid.cpp` so `ki × INTEGRAL_MAX ≥ 0.5`
-  and rebuild, or accept a small steady-state offset held by the proportional
-  term alone.
-
-#### Applying gains and validating
-
-1. Copy the `[pid]` block printed by the script into `bibby.ini` (and the
-   `[feedforward]` block too, if using feedforward — see §9.6).
-2. Restart the frontend (or kill and relaunch to reload the config).
-3. Set a **setpoint 5–10 °C above** the current temperature and switch to
-   **Auto** mode.  Observe the temperature on the history graph.
-4. A well-tuned response rises smoothly and settles with no or minimal
-   overshoot.  If it oscillates, increase λ and rerun the script.
-5. Log the validation run and inspect `pid_ff`, `pid_p`, `pid_i`, `pid_d`
-   columns to confirm the split between feedforward and feedback is sensible,
-   the integral is only trimming, and the derivative is not amplifying noise.
-
-The CSV columns `pid_ff`, `pid_p`, `pid_i`, `pid_d`, `pid_integral`,
-`pid_deriv`, `pid_error`, and `pid_output` are specifically provided for this
-tuning and validation work.
-
----
+**Adaptive scaling.** If batch size varies brew to brew, set
+`adaptive.mc_ref_j_per_c` to the m·c the gains were tuned at and enable
+`adaptive.enable`: kp/kd then scale with the measured batch size within
+`[scale_min, scale_max]`.
 
 ### 9.6 Feedforward (optional, recommended)
 
-A kettle spends most of a brew *holding* a temperature against heat loss.  Left
-to the PID alone, the integrator has to wind all the way up to supply that
-holding power — slow to converge and a source of overshoot.  A **holding
-feedforward** supplies it directly instead, leaving the feedback to trim only
-the model error.
-
-#### The control law
+A kettle spends most of a brew *holding* a temperature against heat loss. Left
+to the PID alone, the integrator must wind up to supply that holding power —
+slow to converge and a source of overshoot. The **holding feedforward**
+supplies it directly:
 
 ```
-u_ff    = clamp( (setpoint − ambient_c) / K , 0, 1 )     // holding duty
-u_total = clamp( u_ff + (P + I + D) , 0, 1 )             // feedforward + feedback
+ff_w    = clamp( (setpoint − ambient_c) / K , 0, max_power )   [watts]
+demand  = clamp( ff_w + P + I + D , 0, max_power )
 ```
 
-`K` is the identified process gain (°C per unit duty, §9.4) and `ambient_c` is a
-reference temperature — both live in the `[feedforward]` section of `bibby.ini`.
-Because `K` is exactly what `identify_plant.py` prints, the step test that tunes
-the PID also sizes the feedforward; the script prints a ready-to-paste
-`[feedforward]` block.  Setting `process_gain_c = 0` disables feedforward (the
-safe default).
+`K` (°C/W) and `ambient_c` live in `[feedforward]`; the same step test that
+tunes the PID sizes the feedforward, and the script prints the block.
+`process_gain_c = 0` disables it (the safe default).
 
-#### Why it does not destabilise or overshoot
+- **It does not change loop stability.** `ff_w` depends on the *setpoint*, not
+  the measurement, so it sits outside the feedback loop; the closed-loop
+  dynamics are unchanged (superposition).
+- **It does not cause overshoot** unless over-sized (K under-estimated). Keep K
+  honest; a slight *under*-estimate of the holding power is the safe direction.
+- **Beware short step tests.** A test that never approaches steady state
+  cannot pin down `K` — only `m·c` (the ramp slope) is well-determined. The
+  script warns in this case; do not enable feedforward from such a fit. This
+  build ships with feedforward disabled for exactly that reason.
+- `ambient_c` is the temperature the kettle sits at unpowered; the window-start
+  temperature of a cold step test is a fine estimate. Errors just become a
+  small bias the integrator removes.
 
-- **It does not change loop stability.** `u_ff` depends on the *setpoint*, not
-  the *measurement*, so it sits outside the feedback loop.  The closed-loop
-  characteristic equation — and therefore stability and the response shape — are
-  unchanged; feedforward only adds a known bias (superposition).
-- **It does not cause overshoot.** Driving the plant with exactly its
-  steady-state holding power produces a monotonic, first-order approach to the
-  setpoint (no overshoot), just slow; the feedback adds the transient push.
-  Feedforward *reduces* overshoot versus an integrator that must wind up from
-  zero.  The only way feedforward overshoots is if it is **over-sized** — e.g.
-  `K` under-estimated, so `u_ff` exceeds the true holding duty and the kettle
-  settles above setpoint until the integrator pulls it back.  Keep `K` honest
-  (use the identified value); if anything, a slight under-estimate is the safe
-  direction.
-- **It lowers the integral-authority requirement.** With the holding power
-  supplied by feedforward, the integrator only covers the feedforward's model
-  error (typically a small fraction of full duty), so `INTEGRAL_MAX` can be
-  small.  The conditional-integration anti-windup (§9.5) automatically confines
-  the integrator to the headroom the feedforward leaves.
-
-#### Estimating `ambient_c`
-
-`ambient_c` is the temperature the kettle sits at with no power.  The simplest
-estimate is the cold-start temperature at the beginning of the step test, which
-the script prints.  It need not be exact: any error in `ambient_c` (or `K`) just
-becomes a small bias the integrator removes.  Feedforward is only active in auto
-mode, and an RTD fault still forces manual control, so it never drives the
-relays on bad data.
+Feedforward is only active in auto mode, and an RTD fault still forces manual,
+so it never drives the relays on bad data.
 
 ---
 
 ## 10. Data logging
 
-`frontend/csv_logger.{h,cpp}` opens one timestamped file per run on startup:
+`src/csv_logger.c` opens one timestamped file per run:
 
 ```
 ~/bibby/logs/YYYY/MM/DD/HH-MM-SS.csv
 ```
 
-Directories are auto-created. One row is written per **fresh** sensor sample,
-right after the PID runs, and each row is `fflush`ed so a crash mid-brew keeps
-the data on disk. Columns:
+Directories are auto-created. In the default high-rate mode one row is written
+per **fresh** sensor sample (~60 Hz), right after the control law runs, and
+each row is flushed so a crash mid-brew keeps the data on disk. During a sensor
+outage a row is still written every 0.5 s so the fault interval is on disk.
+`logging.rate = low` drops to one row per `logging.low_period_s` for long
+unattended runs. Columns:
 
 ```
 wall_time, t_monotonic_s, temp_raw_c, temp_filt_c, setpoint_c,
-duty1, duty2, pid_output, pid_ff, pid_error, pid_p, pid_i, pid_d,
-pid_integral, pid_deriv, manual, grain_in, rtd_fault, watchdog
+p_demand_w, p_delivered_w, duty1, duty2, flux1_w_cm2, flux2_w_cm2,
+pid_ff_w, pid_p_w, pid_i_w, pid_d_w, pid_integral, pid_deriv, pid_error_c,
+mc_est_j_per_c, manual, grain_in, rtd_fault, watchdog
 ```
 
-- `pid_ff` is the holding-feedforward duty (§9.6); `pid_output` is the total
-  commanded duty `clamp(pid_ff + pid_p + pid_i + pid_d)`.
+- `p_demand_w` is the commanded power; `p_delivered_w` is measured from the
+  SSR fired counters over each 0.5 s tick — they differ while the watchdog
+  holds the outputs off, which is itself useful data.
+- `flux1/2_w_cm2` are the per-element surface power densities from the split.
+- `pid_*_w` is the feedforward / P / I / D breakdown in watts (§9.5);
+  `pid_error_c` the residual error.
+- `wall_time` is ISO-8601 local with milliseconds; `t_monotonic_s` is
+  `CLOCK_MONOTONIC`. Recover `dt` from either.
+- `grain_in` marks grain addition; `manual` the control mode; `rtd_fault` the
+  raw MAX31865 fault byte; `watchdog` the ZC watchdog state.
 
-- `wall_time` is ISO-8601 local time with milliseconds; `t_monotonic_s` is the
-  SDL monotonic clock. Recover the sample interval `dt` from either.
-- `grain_in` marks when grain was added; useful for aligning brew events to the
-  temperature trace.
+`tools/plot_logs.py` is a small Tk browser for the log tree — pick a file,
+tick columns, zoom. It reads whatever columns the header declares, so both old
+and new logs open fine.
 
 ---
 
@@ -1008,32 +907,41 @@ pid_integral, pid_deriv, manual, grain_in, rtd_fault, watchdog
 ```
 bibby/
 ├── CLAUDE.md                  project notes / coding conventions
-├── CMakeLists.txt             top-level build (adds the two subprojects)
+├── CMakeLists.txt             build: bibby + tests, fetches LVGL
 ├── README.md                  this file
-├── bibby.ini                  user configuration (mains, elements, PID, RTD cal)
+├── bibby.ini                  user configuration (mains, elements, gains, cal)
+├── deploy/
+│   └── bibby.service          systemd unit (console unbind, memlock, RT prio)
 ├── docs/
-│   └── MAX31865.pdf           sensor datasheet
-├── heater-controller/         C — relay control process
-│   └── main.c
-├── frontend/                  C++ — UI / sensor / PID / logging process
-│   ├── main.cpp
-│   ├── display.{h,cpp}        rotated-FBO display + touch remap
-│   ├── temp_filter.{h,cpp}    second-order moving average
-│   ├── pid.{h,cpp}            PID controller
-│   ├── csv_logger.{h,cpp}     per-run CSV logger
-│   ├── sensors/
-│   │   └── max31865.{h,cpp}   MAX31865 RTD driver
-│   └── gui/
-│       ├── kettle.{h,cpp}     kettle illustration
-│       └── temp_history.{h,cpp} scrolling temperature graph
-├── shared/
-│   ├── shm_types.h            HeaterShm shared-memory layout
-│   ├── config.{h,c}           bibby.ini loader (both processes)
-│   └── single_instance.h      flock single-instance guard
+│   ├── MAX31865.pdf           sensor datasheet
+│   └── REBUILD.md             the plan the single-process rebuild followed
+├── src/
+│   ├── main.c                 startup, GPIO requests, thread spawn, shutdown
+│   ├── state.{h,c}            shared atomics + chart history ring
+│   ├── config.{h,c}           bibby.ini loader
+│   ├── control.{h,c}          watts PID + feedforward
+│   ├── power_split.{h,c}      equal-flux watts→duty split + flux cap
+│   ├── sigma_delta.h          per-ZC sigma-delta modulator
+│   ├── ssr_thread.{h,c}       ZC capture, SSR firing, watchdogs (SCHED_FIFO)
+│   ├── sampler_thread.{h,c}   sensor pacing, filter, control, logging
+│   ├── max31865.{h,c}         MAX31865 RTD driver
+│   ├── temp_filter.{h,c}      boxcar cascade filter
+│   ├── mc_estimator.{h,c}     online thermal-mass estimate
+│   ├── csv_logger.{h,c}       per-run CSV logger
+│   ├── single_instance.h      flock single-instance guard
+│   └── ui/
+│       ├── lv_conf.h          LVGL configuration
+│       ├── ui.{h,c}           LVGL init, fbdev + rotation, evdev touch, ui-test
+│       ├── ui_screen.{h,c}    main screen: charts, slider, toggles, faults
+│       ├── ui_kettle.{h,c}    kettle illustration with element glow
+│       └── ui_theme.h         colors
+├── tests/
+│   └── test_units.c           unit tests for the pure modules
 ├── tools/
-│   └── identify_plant.py      FOPDT identification + PID tuning script (§9.4–9.5)
-├── pi_hat/bibby_pi_hat/       KiCad schematic + PCB + gerbers
-└── third_party/imgui/         vendored Dear ImGui (submodule)
+│   ├── identify_plant.py      FOPDT identification + PID tuning (§9.4–9.5)
+│   ├── calibrate_sensor.py    §9.1/§9.2 calibration arithmetic
+│   └── plot_logs.py           CSV log browser/plotter
+└── pi_hat/bibby_pi_hat/       KiCad schematic + PCB + gerbers
 ```
 
 ---
@@ -1044,7 +952,7 @@ bibby uses three licenses, one per artifact type:
 
 | Artifact | License | File |
 |---|---|---|
-| Software (`frontend/`, `heater-controller/`, `shared/`) | Apache-2.0 | [`LICENSE`](LICENSE) |
+| Software (`src/`, `tests/`, `tools/`, `deploy/`) | Apache-2.0 | [`LICENSE`](LICENSE) |
 | Hardware (`pi_hat/`) | CERN-OHL-P-2.0 | [`pi_hat/LICENSE`](pi_hat/LICENSE) |
 | Documentation (`README.md`, `docs/`) | CC-BY-4.0 | [creativecommons.org/licenses/by/4.0](https://creativecommons.org/licenses/by/4.0/) |
 
@@ -1060,5 +968,3 @@ schematics, PCB layout, and gerbers in `pi_hat/`.
 **CC-BY-4.0** (documentation): attribution-only. You may reproduce, adapt,
 and redistribute the documentation for any purpose as long as you credit the
 original author.
-
-Third-party attributions are in [`NOTICE`](NOTICE).
