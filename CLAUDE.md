@@ -56,6 +56,11 @@ Everything paced by the RTD conversion rate; one pass = heartbeat + read + contr
 - LVGL 9.3.0 (pinned; 9.4 breaks rotation/shutdown), fbdev display + evdev touch, rotated in
   software by `ui.rotation` for the sideways-mounted panel. Touch device auto-probed (first
   evdev node with `ABS_MT_POSITION_X`) unless `ui.touch_device` is set.
+- `src/ui/lv_conf.h` takes LVGL off its built-in fixed pool (`LV_USE_STDLIB_MALLOC =
+  LV_STDLIB_CLIB`): the 64 KB default left ~22 KB of headroom on this screen and a big redraw
+  asserted out of memory in `lv_draw_add_task`. `LV_ASSERT_HANDLER` is `abort()`, not the
+  default `while(1);` — an assert must not wedge the UI thread at 100 % CPU with the elements
+  live; dying drops the GPIO lines and lets `bibby.service` restart the process.
 - `ui.c` = LVGL/backend init + the `--ui-test` bring-up screen (corner markers + crosshair,
   for checking rotation and touch mapping). `ui_screen.c` = the controller screen,
   `ui_kettle.c` = the kettle cutaway with element glow, `ui_theme.h` = the palette.
@@ -63,6 +68,8 @@ Everything paced by the RTD conversion rate; one pass = heartbeat + read + contr
   manual, read-only live demand in auto), ±10/±1/±0.1 setpoint steppers, ZC Sim / Grain In /
   Manual Control toggles, temperature chart, power chart (demand/delivered/ff/P/I/D), fault
   band, m·c + adaptive-scale status line. Refresh timer at 250 ms, charts every other tick.
+- Each chart carries a row of legend chips; tapping one hides that trace and drops it from
+  that chart's autoscale (`vis[]` / `trace[]` in `ui_screen.c`). All traces start visible.
 - **The UI owns no control or safety logic.** It reads the state snapshot and writes only
   `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in`, `simulate_zc`.
 
@@ -116,8 +123,9 @@ chart history ring.
   pid_d_w, pid_integral, pid_deriv, pid_error_c, mc_est_j_per_c, manual, grain_in,
   rtd_fault, watchdog`. `wall_time` is ISO-8601 local with ms; there is no `dt` column —
   recover time from `wall_time` or `t_monotonic_s`.
-- `tools/plot_logs.py` browses/plots the logs; `tools/identify_plant.py` fits FOPDT gains
-  from a step-test log.
+- `tools/plot_logs.py` browses/plots the logs; `tools/identify_plant.py` drives the lumped
+  kettle model with the logged `p_delivered_w` and fits m·c, k_loss, L by least squares
+  (heat-then-cool test, whole log, `--ambient` required), then prints PID/feedforward blocks.
 
 ## MAX31865 Sensor — `src/max31865.{h,c}`
 - PT100, 3-wire, continuous conversion → a fresh sample every mains-notch period (~50/60 Hz).

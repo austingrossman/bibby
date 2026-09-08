@@ -19,6 +19,22 @@
 #define LV_FONT_MONTSERRAT_48 1
 #define LV_FONT_DEFAULT &lv_font_montserrat_16
 
+// Memory. LVGL's built-in allocator is a fixed pool sized for MCU targets
+// (64 KB by default); this screen — two multi-series charts, their legend
+// chips, the kettle — sits at ~36 KB of it steady state and peaks near 42 KB,
+// so one large redraw could exhaust the rest and assert inside
+// lv_draw_add_task. On Linux there is no reason for a ceiling: take the
+// allocator from libc and let the heap grow.
+#define LV_USE_STDLIB_MALLOC LV_STDLIB_CLIB
+
+// An LVGL assertion must never spin with the elements live: the default
+// handler is `while(1);`, which wedges the UI thread at 100% CPU, leaves the
+// panel unresponsive, and swallows SIGTERM. Abort instead — the kernel drops
+// the GPIO requests, the SoC pull-downs hold the SSR inputs low, and
+// bibby.service restarts the process.
+#define LV_ASSERT_HANDLER_INCLUDE <stdlib.h>
+#define LV_ASSERT_HANDLER abort();
+
 #define LV_USE_LOG 1
 #define LV_LOG_LEVEL LV_LOG_LEVEL_WARN
 #define LV_LOG_PRINTF 1

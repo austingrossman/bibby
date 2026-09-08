@@ -253,13 +253,25 @@ LVGL 9.3 rendering directly to the framebuffer:
   evdev device advertising absolute multitouch (`ui.touch_device = auto`).
 - **Layout:** toggles (ZC Sim, Grain In, Manual Control) and ±10/±1/±0.1
   setpoint steppers on top; temperature chart (setpoint, filtered, raw, grain
-  and mode-change markers) and power/PID-term chart below; vertical power
+  and mode-change markers) and power/PID-term chart below, each under a row of
+  tappable legend chips that show/hide individual traces; vertical power
   slider (manual watts in manual, live demand readout in auto); kettle graphic
   whose element glow follows the commanded duties; fault band (decoded RTD
   faults, watchdog, forced-manual notice); status line (m·c estimate and
   adaptive scale).
 - LVGL is pinned to **v9.3.0**: v9.4 breaks the fbdev software-rotation path
   and hangs in `lv_deinit` on shutdown.
+- **Memory (`src/ui/lv_conf.h`):** LVGL's built-in allocator is a fixed pool
+  sized for microcontrollers — 64 KB by default, and this screen sits at ~36 KB
+  of it with peaks near 42 KB, so a large redraw could exhaust the remainder and
+  assert inside `lv_draw_add_task` ("Out of memory"). bibby therefore sets
+  `LV_USE_STDLIB_MALLOC = LV_STDLIB_CLIB`: LVGL allocates from the system heap
+  and there is no ceiling to tune.
+- **Assertions:** LVGL's default `LV_ASSERT_HANDLER` is `while(1);`, which would
+  wedge the UI thread at 100 % CPU — panel frozen, SIGTERM ignored, control
+  threads still driving the elements. bibby sets it to `abort()` instead: the
+  process dies, the kernel drops the GPIO requests, the SoC pull-downs hold the
+  SSR inputs low, and `bibby.service` restarts it (§5.3).
 - The kernel console shares `/dev/fb0` and will draw its blinking cursor over
   the UI; the systemd unit unbinds it (§5.3).
 
@@ -526,7 +538,7 @@ full procedures.
 ./build/bibby --ui-test        # display/touch bring-up screen (§2.8)
 ./build/bibby --headless       # no display: prints a status line every 2 s
 ./build/bibby --sim-zc         # start with simulated zero crossings (bench)
-./build/bibby --manual-w 2000  # start in manual at 2000 W (step tests)
+./build/bibby --manual-w 8000  # start in manual at 8000 W (plant-ID tests)
 ./build/bibby -c /path/to.ini  # explicit config
 ```
 
@@ -543,9 +555,15 @@ than exiting — the controller and safety logic keep running.
 - **Setpoint steppers:** ±10 / ±1 / ±0.1 °C.
 - **Toggles:** ZC Sim (simulate zero crossings — bench only), Grain In (gain
   set swap + logged event marker), Manual Control (manual watts vs PID auto).
-- **Charts:** temperature (setpoint / filtered / raw + grain and mode-change
-  markers) and power (demand W / delivered / ff / P / I / D), window set by
-  `ui.chart_window_min`, y-autoscaled.
+- **Charts:** temperature (setpoint / temp / raw + grain-event and mode-event
+  markers — short dashes along the top edge at the samples where Grain In or
+  Manual flipped) and power (demand W / delivered / ff / P / I / D), window set
+  by `ui.chart_window_min`, y-autoscaled.
+- **Chart legends:** each trace has a chip under its chart — tap to drop that
+  trace. A hidden trace is neither drawn nor counted in that chart's autoscale,
+  so switching off the terms you are not tuning zooms the pane onto the rest.
+  Chips are colored when on, greyed and struck through when off; all traces
+  start visible on every launch.
 - **Fault band:** decoded RTD faults, watchdog alarm, and "Auto disabled →
   manual" when a fault forced the mode switch.
 - **Status line:** m·c estimate (≈ batch size) and adaptive gain scale.
@@ -710,7 +728,7 @@ dominant time constant.
 
 For a 30 L batch in a reasonably insulated kettle $\tau$ is typically **20–40
 minutes**. The initial ramp rate at power $P$ is $P/(m\,c_p)$ — easy to check
-directly against the step test, and the basis of the online $m\,c$ estimator
+directly against the heating phase of the identification test, and the basis of the online $m\,c$ estimator
 (§2.7).
 
 #### RTD probe lag
@@ -806,28 +824,52 @@ kd_ini = Kd_c / T_s
 
 ### 9.4 System identification
 
-`K`, `τ`, and `L` come from an **open-loop step test**: command constant watts
-in manual mode and record the temperature response.
-`tools/identify_plant.py` fits the model and prints ready-to-paste
-`[pid]`/`[feedforward]` blocks.
+`m·c`, `k_loss`, and `L` come from a **heat-then-cool test**: run the elements
+at a fixed high power in manual mode until the kettle reaches mash
+temperature, then turn them off and let it cool. `tools/identify_plant.py`
+drives the lumped model of §9.3 with the power the log says was actually
+delivered, fits the three parameters to the measured temperature by least
+squares, and prints ready-to-paste `[pid]`/`[feedforward]` blocks.
 
-#### Step-test procedure
+Each phase pins down something the other cannot:
 
-1. **Fill** the kettle to the intended brew volume and start the recirculation
-   pump. Good mixing is required for the lumped-thermal-mass model to hold.
-2. **Stabilise.** Let the temperature settle a few minutes at 0 W.
-3. **Apply the step.** Manual Control on; set the power slider to **30–50 %**
-   of maximum (a clear signal, well clear of boiling for ≥ 15 min); leave it.
-   (`--manual-w` on the command line does the same from startup.)
-4. **Log.** The CSV logger runs continuously. Let it run until the temperature
-   has risen **15–25 °C**, or ≥ **15 minutes** — whichever comes first. Longer
-   is better: a test that approaches steady state pins down `K` and `τ`
-   individually, not just their ratio.
-5. **End.** Slider back to 0. Note the time to locate the step in the log.
-6. **Copy the log** from `~/bibby/logs/YYYY/MM/DD/HH-MM-SS.csv`.
+| Phase | Determines | Why |
+|---|---|---|
+| Heating ramp | `m·c` | slope = P / m·c; the loss term is small against 8 kW |
+| Power on/off corners | `L` | the measured trace turns `L` seconds after the power does |
+| Cooling decay | `k_loss` | at 0 W the kettle relaxes toward ambient at rate k_loss / m·c |
 
-> If the liquid reaches boiling, stop — the model changes once evaporative
-> cooling is significant.
+A constant-power step alone cannot separate `K` from `τ` unless it runs to
+steady state, which for a BIAB kettle at any useful power sits above boiling.
+The cooling phase removes that problem: `K = 1/k_loss` and `τ = m·c/k_loss`
+follow directly.
+
+#### Test procedure
+
+1. **Fill** the kettle to the intended brew volume, with the lid and the
+   recirculation pump exactly as you will brew. `k_loss` depends on the lid,
+   insulation, and pump heat, so the test setup must match the brew setup.
+   Good mixing is required for the lumped model to hold.
+2. **Measure the room temperature** with a separate thermometer near the
+   kettle. This is the `--ambient` input; the script does not estimate it.
+3. **Start bibby** (the CSV logger runs from startup) and leave it a minute at
+   0 W so the log has a quiet lead-in.
+4. **Heat.** Manual Control on; set the power slider to about **80 %** of
+   maximum and leave it until the temperature reaches mash temperature
+   (**~65 °C**). Do not approach boiling: evaporation changes `k_loss`.
+   (`--manual-w` on the command line applies the power from startup.)
+5. **Cool.** Slider to 0 W. Leave the pump running and the lid as it was, and
+   let the kettle cool until the temperature has dropped **at least 5 °C**;
+   30 minutes or more is better. The longer the decay, the tighter `k_loss`.
+   A well-insulated kettle cools very slowly (a cooling time constant of
+   hours is normal), so give it an hour or more — the holding power near mash
+   temperature is pinned down early, but separating `k_loss` from the ambient
+   value takes a longer decay.
+6. **Stop** bibby and copy the log from `~/bibby/logs/YYYY/MM/DD/HH-MM-SS.csv`.
+
+The power trace does not have to be clean — the script uses whatever
+`p_delivered_w` says was delivered, sample by sample — but the plant must not
+change mid-test (no adding water, no lid on/off).
 
 #### Running the identification
 
@@ -835,45 +877,77 @@ in manual mode and record the temperature response.
 pip3 install numpy scipy matplotlib pandas    # once
 
 python3 tools/identify_plant.py logs/YYYY/MM/DD/HH-MM-SS.csv \
-        --t-start 120 --t-end 1020 -o step_fit.png
+        --ambient 21.5 --volume-l 45 -o plant_fit.png
 
-# Specify the step power explicitly (otherwise the log median is used),
-# and λ for a more conservative IMC tuning:
-python3 tools/identify_plant.py logs/... --watts 4000 --lambda 60
+# τc for a more conservative SIMC tuning:
+python3 tools/identify_plant.py logs/... --ambient 21.5 --lambda 300
 ```
 
-`--t-start`/`--t-end` are seconds from the start of the log; trim the window
-to the step. Old duty-format logs (pre-rebuild) are converted with
-`--e1-watts`/`--e2-watts`.
+The whole log is used; there is no window to choose. `--ambient` is the room
+temperature you measured, in °C; `--volume-l` is the water you put in, used
+only for the delivered-watts cross-check below. The script prints:
 
-The script prints the FOPDT fit, a physical cross-check — `k_loss`, `m·c`
-(compare against the actual litres × 4.186 kJ/°C), and the °C/min ramp rate —
-tuned gains per rule, and the INI blocks. The plot shows the measured
-temperature, the fit, the power trace, and residuals; inspect the residuals to
-confirm the model fits.
+- the power phases it found (heat/cool spans, mean watts, temperature range);
+- the fitted `m·c` (compare against litres × 4.186 kJ/°C), `k_loss`, and `L`,
+  each with a standard error, the fit RMSE overall and per phase, and a
+  cross-check fit with the ambient left free — a gap of more than a couple of
+  °C from your `--ambient` means the room reading or the setup is off;
+- warnings when the log cannot support the fit: no cooling phase, a poorly
+  determined `k_loss`, temperatures above 90 °C, or a large RMSE;
+- two corner diagnostics the lumped model does not contain (below): the dead
+  time read directly off the power-on corner, and the mixing offset;
+- with `--volume-l`, the ratio of the fitted `m·c` to the water's own `m·c`.
+  A ratio well above 1 means the elements delivered fewer watts than
+  `element1_watts`/`element2_watts` claim — mains below the rating voltage,
+  element resistance tolerance, SSR drop. Every watts-based quantity in bibby
+  (gains, feedforward, flux cap, the on-screen `m·c`) is off by that factor
+  until the INI ratings are corrected (measure V and R, `P = V²/R`) and the
+  test rerun;
+- the FOPDT equivalents `K`, `τ`, `L`, tuned gains per rule, and the INI blocks.
+
+**Corners.** A real kettle does two things at the power transitions that a
+lumped mass cannot. First, the probe usually sits in the recirculation flow
+downstream of the elements and reads a few tenths of a degree above the bulk
+while they run — visible as a fast drop in the first minute after power-off.
+The script reports this *mixing offset*; scaled to holding power it is
+hundredths of a degree and can be ignored for control. Second, because that
+transient dominates the corners, the least-squares dead time is unreliable
+(it went to zero on the first real run). The script therefore also reads `L`
+straight off the power-on corner — the time for the measured slope to reach
+half its steady ramp value — and uses the larger of the two for tuning.
+
+The plot shows the measured temperature against the model (heating phases
+shaded), the delivered power, and the residuals. Spikes in the residual at the
+power corners are the mixing offset and probe lag above. A residual that
+drifts through the cooling phase means `k_loss` or the ambient value is wrong.
 
 | Parameter | Physical meaning | Implication |
 |---|---|---|
-| `K` | 1 / heat-loss coefficient | Large K: heater dominates; steady state far above ambient |
-| `τ` | Thermal time constant of the batch | Larger batch = larger τ; the loop can afford slower response |
+| `m·c` | Batch thermal mass | Sanity check vs. litres; sets the ramp rate P/(m·c); reference for adaptive scaling |
+| `k_loss` | Heat loss per °C above ambient | Holding power = k_loss × (setpoint − ambient); needs the cooling phase |
+| `K = 1/k_loss` | Steady-state gain | Large K: heater dominates; steady state far above ambient |
+| `τ = m·c/k_loss` | Thermal time constant | Larger batch = larger τ; the loop can afford slower response |
 | `L` | Probe lag + filter delay | Limits tuning aggression; keep the probe well-immersed |
 | `L/τ` | Relative dead time | < 0.1 easy; > 0.5 requires careful detuning |
-| `m·c` | Batch thermal mass | Sanity check vs. litres; reference for adaptive scaling |
 
 ### 9.5 PID tuning
 
-Auto mode commands zero power until `pid.kp/ki/kd` are set. The script offers
-three rules, all from the same fit:
+Auto mode commands zero power until `pid.kp/ki/kd` are set. The script
+prints SIMC-PI by default; `--rule zn|cc|all` adds the classical rules:
 
 | Rule | Characteristic | When to use |
 |---|---|---|
-| **IMC-PI** | Smooth, no overshoot; λ sets speed vs. robustness | First choice for BIAB; tune λ to taste |
-| **ZN-PID** | Aggressive, ~25 % overshoot | Upper bound on aggressiveness only |
-| **CC-PID** | Balanced at moderate `L/τ` | Sanity check against IMC |
+| **SIMC-PI** | Skogestad's IMC: `Kp = τ/(K(τc+L))`, `Ti = min(τ, 4(τc+L))`; τc sets speed vs. robustness | First choice for BIAB; tune τc with `--lambda` |
+| **ZN-PID** | Aggressive, ~25 % overshoot | Reaction-curve rule; meaningless when `L ≪ τ` |
+| **CC-PID** | Balanced at moderate `L/τ` | Same caveat as ZN |
 
-For a mash, **IMC-PI** with `λ ≈ L` is a good start. Overshoot costs enzyme
-activity — err toward larger λ. Keep `kd = 0`: at 60 Hz the raw per-sample
-derivative mostly amplifies sensor noise.
+The cap on the integral time is what makes SIMC usable here: an insulated
+kettle has a `τ` of hours, and plain IMC-PI (`Ti = τ`) would leave the
+integrator uselessly slow, while ZN/CC divide by `L/τ` and print absurd gains.
+The default `τc = max(3L, 120 s)` is deliberately smooth — the corner
+transients of §9.4 are not in the model. Overshoot costs enzyme activity — err
+toward larger τc. Keep `kd = 0`: at 60 Hz the raw per-sample derivative mostly
+amplifies sensor noise.
 
 The shipped `bibby.ini` carries IMC-PI starting gains identified from this
 build's 2026-06-20 bench tests (~15 L, 5000+5500 W elements). **Validate on
@@ -884,7 +958,7 @@ your own setup before trusting a batch:**
 2. Set a setpoint **5–10 °C above** current temperature, switch to **Auto**,
    and watch the charts.
 3. A good response rises smoothly and settles with minimal overshoot. If it
-   oscillates, increase λ and re-run the script.
+   oscillates, increase τc (`--lambda`) and re-run the script.
 4. Inspect the logged `pid_ff_w`/`pid_p_w`/`pid_i_w`/`pid_d_w` split: the
    feedforward should carry the holding power, the integral only trim, the
    derivative not chatter.
@@ -893,7 +967,7 @@ Anti-windup needs no configuration: conditional integration plus the
 `max_power/ki` backstop (§2.4) bound the integrator automatically.
 
 **Grain-in gains.** Adding grain changes the plant (more mass, worse mixing,
-scorch risk at the bag). Re-run the step test with grain in (or a sacrificial
+scorch risk at the bag). Re-run the heat/cool test with grain in (or a sacrificial
 equivalent) to derive `grain.kp/ki/kd`, and consider `grain.max_power_w` to cap
 flux at the bag.
 
@@ -914,8 +988,8 @@ ff_w    = clamp( (setpoint − ambient_c) / K , 0, max_power )   [watts]
 demand  = clamp( ff_w + P + I + D , 0, max_power )
 ```
 
-`K` (°C/W) and `ambient_c` live in `[feedforward]`; the same step test that
-tunes the PID sizes the feedforward, and the script prints the block.
+`K` (°C/W) and `ambient_c` live in `[feedforward]`; the same heat/cool test
+that tunes the PID sizes the feedforward, and the script prints the block.
 `process_gain_c = 0` disables it (the safe default).
 
 - **It does not change loop stability.** `ff_w` depends on the *setpoint*, not
@@ -923,13 +997,14 @@ tunes the PID sizes the feedforward, and the script prints the block.
   dynamics are unchanged (superposition).
 - **It does not cause overshoot** unless over-sized (K under-estimated). Keep K
   honest; a slight *under*-estimate of the holding power is the safe direction.
-- **Beware short step tests.** A test that never approaches steady state
-  cannot pin down `K` — only `m·c` (the ramp slope) is well-determined. The
-  script warns in this case; do not enable feedforward from such a fit. This
-  build ships with feedforward disabled for exactly that reason.
-- `ambient_c` is the temperature the kettle sits at unpowered; the window-start
-  temperature of a cold step test is a fine estimate. Errors just become a
-  small bias the integrator removes.
+- **`k_loss` needs the cooling phase.** A heat-only log cannot separate `K`
+  from `τ`; the script warns and tells you to leave `process_gain_c = 0`.
+  This build ships with feedforward disabled for exactly that reason.
+- `ambient_c` is the room temperature you passed as `--ambient`; the script
+  copies it into the block. If the kettle habitually rests above room
+  temperature (pump heat), the script's free-ambient cross-check will say so —
+  use that value instead. Errors just become a small bias the integrator
+  removes.
 
 Feedforward is only active in auto mode, and an RTD fault still forces manual,
 so it never drives the relays on bad data.
@@ -1011,7 +1086,7 @@ bibby/
 ├── tests/
 │   └── test_units.c           unit tests for the pure modules
 ├── tools/
-│   ├── identify_plant.py      FOPDT identification + PID tuning (§9.4–9.5)
+│   ├── identify_plant.py      heat/cool plant identification + PID tuning (§9.4–9.5)
 │   ├── calibrate_sensor.py    §9.1/§9.2 calibration arithmetic
 │   └── plot_logs.py           CSV log browser/plotter
 └── pi_hat/bibby_pi_hat/       KiCad schematic + PCB + gerbers

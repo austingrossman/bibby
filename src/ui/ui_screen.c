@@ -14,6 +14,7 @@
 // the control or safety path.
 #include "ui_screen.h"
 
+#include <stdint.h>
 #include <stdio.h>
 
 #include "../max31865.h"
@@ -50,6 +51,19 @@ static int32_t a_grain_ev[CHART_MAX_PTS], a_mode_ev[CHART_MAX_PTS];
 static int32_t a_demand[CHART_MAX_PTS], a_deliv[CHART_MAX_PTS], a_ff[CHART_MAX_PTS];
 static int32_t a_p[CHART_MAX_PTS], a_i[CHART_MAX_PTS], a_d[CHART_MAX_PTS];
 static HistPoint snap[CHART_MAX_PTS];
+
+// Per-trace visibility, driven by the legend chips under each chart. A hidden
+// trace is neither drawn nor counted in that chart's auto-range, so switching
+// off the terms you are not watching zooms the pane onto the rest.
+enum {
+  V_SET, V_FILT, V_RAW, V_GRAIN, V_MODE,
+  V_DEMAND, V_DELIV, V_FF, V_P, V_I, V_D, V_COUNT
+};
+static bool vis[V_COUNT];
+static struct {
+  lv_obj_t           *chart;
+  lv_chart_series_t **ser;
+} trace[V_COUNT];
 
 static float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
@@ -155,6 +169,71 @@ static lv_chart_series_t *add_series(lv_obj_t *chart, uint32_t color,
   return s;
 }
 
+// Legend chips: checked = trace visible. Colored when on, grey when off.
+static void legend_cb(lv_event_t *e) {
+  lv_obj_t *chip = lv_event_get_target(e);
+  int       idx  = (int)(intptr_t)lv_event_get_user_data(e);
+  vis[idx] = lv_obj_has_state(chip, LV_STATE_CHECKED);
+  lv_chart_hide_series(trace[idx].chart, *trace[idx].ser, !vis[idx]);
+}
+
+static lv_obj_t *make_legend_row(lv_obj_t *parent, int x, int y, int w) {
+  lv_obj_t *r = lv_obj_create(parent);
+  lv_obj_set_pos(r, x, y);
+  lv_obj_set_size(r, w, 30);
+  lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(r, 0, 0);
+  lv_obj_set_style_pad_all(r, 0, 0);
+  lv_obj_set_style_pad_column(r, 6, 0);
+  lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  return r;
+}
+
+// One chip per trace: registers the series and starts visible. The chip is a
+// full-height 30 px button so it is still a fair touch target on the panel.
+static void make_chip(lv_obj_t *row, int idx, lv_obj_t *chart,
+                      lv_chart_series_t **ser, uint32_t color,
+                      const char *txt) {
+  trace[idx].chart = chart;
+  trace[idx].ser   = ser;
+  vis[idx]         = true;
+
+  lv_obj_t *b = lv_button_create(row);
+  lv_obj_set_size(b, LV_SIZE_CONTENT, 30);
+  lv_obj_set_style_min_width(b, 46, 0);
+  lv_obj_set_style_pad_hor(b, 9, 0);
+  lv_obj_set_style_radius(b, 6, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
+  lv_obj_set_style_border_width(b, 1, 0);
+  lv_obj_set_style_bg_color(b, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_border_color(b, lv_color_hex(UI_BORDER), 0);
+  lv_obj_set_style_text_color(b, lv_color_hex(0x5a6472), 0);
+  // Struck through when off, so the two muted traces (raw, D) can't be
+  // mistaken for disabled chips.
+  lv_obj_set_style_text_decor(b, LV_TEXT_DECOR_STRIKETHROUGH, 0);
+  lv_obj_set_style_text_decor(b, LV_TEXT_DECOR_NONE, LV_STATE_CHECKED);
+  lv_obj_set_style_bg_color(b, lv_color_hex(UI_PANEL_HI), LV_STATE_CHECKED);
+  lv_obj_set_style_border_color(b, lv_color_hex(color), LV_STATE_CHECKED);
+  lv_obj_set_style_text_color(b, lv_color_hex(color), LV_STATE_CHECKED);
+  lv_obj_add_flag(b, LV_OBJ_FLAG_CHECKABLE);
+  lv_obj_add_state(b, LV_STATE_CHECKED);
+
+  lv_obj_t *l = lv_label_create(b);
+  lv_label_set_text(l, txt);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_center(l);
+  lv_obj_add_event_cb(b, legend_cb, LV_EVENT_VALUE_CHANGED,
+                      (void *)(intptr_t)idx);
+}
+
+static void fold(int32_t v, int32_t *lo, int32_t *hi) {
+  if (v < *lo) *lo = v;
+  if (v > *hi) *hi = v;
+}
+
 static lv_obj_t *make_chart(lv_obj_t *parent, int x, int y, int w, int h) {
   lv_obj_t *c = lv_chart_create(parent);
   lv_obj_set_pos(c, x, y);
@@ -190,7 +269,7 @@ static void update_charts(void) {
 
   // Ranges while filling. Temperatures in centi-degC; powers in watts.
   int32_t tmin = 0, tmax = 0, pmin = 0, pmax = 0;
-  bool first = true;
+  bool t_have = false, p_have = false;
   int prev_i = -1;
   for (int k = 0; k < n; k++) {
     int i = pts - 1 - (int)((now - snap[k].t_s) / 0.5);
@@ -213,14 +292,30 @@ static void update_charts(void) {
       a_d[j]      = (int32_t)snap[k].d_w;
     }
 
-    int32_t tlo = LV_MIN(a_filt[i], LV_MIN(a_set[i], a_raw[i]));
-    int32_t thi = LV_MAX(a_filt[i], LV_MAX(a_set[i], a_raw[i]));
-    int32_t plo = LV_MIN(a_ff[i], LV_MIN(LV_MIN(a_p[i], a_i[i]), a_d[i]));
-    int32_t phi = LV_MAX(a_demand[i], LV_MAX(a_deliv[i],
-                  LV_MAX(a_ff[i], LV_MAX(a_p[i], LV_MAX(a_i[i], a_d[i])))));
-    if (first) { tmin = tlo; tmax = thi; pmin = plo; pmax = phi; first = false; }
-    tmin = LV_MIN(tmin, tlo); tmax = LV_MAX(tmax, thi);
-    pmin = LV_MIN(pmin, plo); pmax = LV_MAX(pmax, phi);
+    // Only the traces the legend leaves enabled drive the auto-range, so
+    // hiding a trace zooms the pane onto whatever is still shown.
+    int32_t tlo = INT32_MAX, thi = INT32_MIN;
+    if (vis[V_SET])  fold(a_set[i],  &tlo, &thi);
+    if (vis[V_FILT]) fold(a_filt[i], &tlo, &thi);
+    if (vis[V_RAW])  fold(a_raw[i],  &tlo, &thi);
+    if (tlo <= thi) {
+      tmin = t_have ? LV_MIN(tmin, tlo) : tlo;
+      tmax = t_have ? LV_MAX(tmax, thi) : thi;
+      t_have = true;
+    }
+
+    int32_t plo = INT32_MAX, phi = INT32_MIN;
+    if (vis[V_DEMAND]) fold(a_demand[i], &plo, &phi);
+    if (vis[V_DELIV])  fold(a_deliv[i],  &plo, &phi);
+    if (vis[V_FF])     fold(a_ff[i],     &plo, &phi);
+    if (vis[V_P])      fold(a_p[i],      &plo, &phi);
+    if (vis[V_I])      fold(a_i[i],      &plo, &phi);
+    if (vis[V_D])      fold(a_d[i],      &plo, &phi);
+    if (plo <= phi) {
+      pmin = p_have ? LV_MIN(pmin, plo) : plo;
+      pmax = p_have ? LV_MAX(pmax, phi) : phi;
+      p_have = true;
+    }
   }
 
   // Pad the ranges: at least 0.1 degC beyond the temperature data, 5% + a
@@ -230,7 +325,8 @@ static void update_charts(void) {
   pmin = LV_MIN(pmin, 0); pmax = LV_MAX(pmax, 100);
   int32_t ppad = LV_MAX(20, (pmax - pmin) / 20);
   pmin -= (pmin < 0) ? ppad : 0; pmax += ppad;
-  if (first) { tmin = 0; tmax = 10000; pmin = 0; pmax = 1000; }
+  if (!t_have) { tmin = 0; tmax = 10000; }
+  if (!p_have) { pmin = 0; pmax = 1000; }
 
   // Event markers: short dashes at the top edge on grain / mode transitions.
   for (int k = 1; k < n; k++) {
@@ -418,19 +514,8 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
   }
 
   // ── Charts ──
-  lv_obj_t *leg1 = make_label(scr, 70, 182, &lv_font_montserrat_14, UI_TEXT_DIM, "");
-  lv_label_set_recolor(leg1, true);
-  lv_label_set_text(leg1,
-      "#37c871 setpoint#   #50c8ff temp#   #9aa4b0 raw#   "
-      "#ffb020 |grain#   #4aa8ff |mode#");
   S.chart_temp = make_chart(scr, 70, 205, 710, 245);
-
-  lv_obj_t *leg2 = make_label(scr, 70, 460, &lv_font_montserrat_14, UI_TEXT_DIM, "");
-  lv_label_set_recolor(leg2, true);
-  lv_label_set_text(leg2,
-      "#ff8c2e demand W#   #a06428 delivered#   #2fd4c4 ff#   "
-      "#4aa8ff P#   #b07aff I#   #9aa4b0 D#");
-  S.chart_pow = make_chart(scr, 70, 483, 710, 175);
+  S.chart_pow  = make_chart(scr, 70, 483, 710, 175);
 
   for (int i = 0; i < 3; i++) {
     S.ylab_temp[i] = make_label(scr, 4, 205 + i * 110, &lv_font_montserrat_14,
@@ -455,6 +540,24 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
   S.s_i      = add_series(S.chart_pow, UI_VIOLET, a_i);
   S.s_d      = add_series(S.chart_pow, 0x9aa4b0, a_d);
   S.s_demand = add_series(S.chart_pow, UI_ORANGE, a_demand);
+
+  // ── Legends: tap a chip to drop that trace off its chart ──
+  lv_obj_t *leg1 = make_legend_row(scr, 70, 173, 710);
+  make_chip(leg1, V_SET,   S.chart_temp, &S.s_set,      UI_GREEN, "setpoint");
+  make_chip(leg1, V_FILT,  S.chart_temp, &S.s_filt,     UI_TRACE, "temp");
+  make_chip(leg1, V_RAW,   S.chart_temp, &S.s_raw,      0x9aa4b0, "raw");
+  // The two event traces are dashes along the top edge, not curves: they mark
+  // the samples where Grain In / Manual flipped.
+  make_chip(leg1, V_GRAIN, S.chart_temp, &S.s_grain_ev, UI_AMBER, "grain event");
+  make_chip(leg1, V_MODE,  S.chart_temp, &S.s_mode_ev,  UI_BLUE,  "mode event");
+
+  lv_obj_t *leg2 = make_legend_row(scr, 70, 451, 710);
+  make_chip(leg2, V_DEMAND, S.chart_pow, &S.s_demand, UI_ORANGE, "demand W");
+  make_chip(leg2, V_DELIV,  S.chart_pow, &S.s_deliv,  0xc4823f,  "delivered");
+  make_chip(leg2, V_FF,     S.chart_pow, &S.s_ff,     UI_TEAL,   "ff");
+  make_chip(leg2, V_P,      S.chart_pow, &S.s_p,      UI_BLUE,   "P");
+  make_chip(leg2, V_I,      S.chart_pow, &S.s_i,      UI_VIOLET, "I");
+  make_chip(leg2, V_D,      S.chart_pow, &S.s_d,      0x9aa4b0,  "D");
 
   // ── Fault band + status (bottom-left) ──
   S.fault_band = make_panel(scr, 10, 668, 590, 46);
