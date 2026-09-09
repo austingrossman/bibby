@@ -25,6 +25,9 @@
 
 #define CHART_MAX_PTS 3600  // 30 min at one point per 0.5 s
 
+#define TRACE_W      2  // every chart trace (LV_PART_ITEMS line width)
+#define TRACE_W_FILT 4  // except the filtered temperature, the one to read
+
 static BibbyState        *ST;
 static const BibbyConfig *CFG;
 
@@ -38,6 +41,8 @@ static struct {
 
   lv_chart_series_t *s_set, *s_filt, *s_raw, *s_grain_ev, *s_mode_ev;
   lv_chart_series_t *s_demand, *s_deliv, *s_ff, *s_p, *s_i, *s_d;
+
+  uint32_t filt_series_idx;  // insertion index of s_filt (see the draw hook)
 
   int    chart_pts;
   float  max_watts;
@@ -169,6 +174,29 @@ static lv_chart_series_t *add_series(lv_obj_t *chart, uint32_t color,
   return s;
 }
 
+// A series' position in the chart's list, which is also the id1 the draw
+// descriptor carries — see temp_chart_task_cb.
+static uint32_t series_index(lv_obj_t *chart, const lv_chart_series_t *want) {
+  uint32_t i = 0;
+  for (lv_chart_series_t *s = lv_chart_get_series_next(chart, NULL); s;
+       s = lv_chart_get_series_next(chart, s), i++)
+    if (s == want) return i;
+  return UINT32_MAX;
+}
+
+// LVGL draws every series of a chart from one line descriptor, so a per-trace
+// width has to be patched into the draw task on its way out: LV_PART_ITEMS
+// picks the series lines out from the division grid, and id1 says which
+// series. Only the filtered temperature gets the thicker line.
+static void temp_chart_task_cb(lv_event_t *e) {
+  lv_draw_task_t *t = lv_event_get_draw_task(e);
+  if (lv_draw_task_get_type(t) != LV_DRAW_TASK_TYPE_LINE) return;
+  lv_draw_line_dsc_t *dsc = lv_draw_task_get_draw_dsc(t);
+  if (dsc->base.part != LV_PART_ITEMS) return;
+  if (dsc->base.id1 != S.filt_series_idx) return;
+  dsc->width = TRACE_W_FILT;
+}
+
 // Legend chips: checked = trace visible. Colored when on, grey when off.
 static void legend_cb(lv_event_t *e) {
   lv_obj_t *chip = lv_event_get_target(e);
@@ -247,7 +275,7 @@ static lv_obj_t *make_chart(lv_obj_t *parent, int x, int y, int w, int h) {
   lv_obj_set_style_radius(c, 6, 0);
   lv_obj_set_style_pad_all(c, 2, 0);
   lv_obj_set_style_size(c, 0, 0, LV_PART_INDICATOR);  // no point dots
-  lv_obj_set_style_line_width(c, 2, LV_PART_ITEMS);
+  lv_obj_set_style_line_width(c, TRACE_W, LV_PART_ITEMS);
   return c;
 }
 
@@ -528,11 +556,18 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
     lv_obj_set_style_text_align(S.ylab_pow[i], LV_TEXT_ALIGN_RIGHT, 0);
   }
 
+  // LVGL walks the series list back to front, so the first one added is drawn
+  // last, on top: setpoint over the filtered temperature over raw, with the
+  // event dashes furthest back.
   S.s_set      = add_series(S.chart_temp, UI_GREEN, a_set);
-  S.s_raw      = add_series(S.chart_temp, 0x55606c, a_raw);
   S.s_filt     = add_series(S.chart_temp, UI_TRACE, a_filt);
+  S.s_raw      = add_series(S.chart_temp, 0x55606c, a_raw);
   S.s_grain_ev = add_series(S.chart_temp, UI_AMBER, a_grain_ev);
   S.s_mode_ev  = add_series(S.chart_temp, UI_BLUE, a_mode_ev);
+  S.filt_series_idx = series_index(S.chart_temp, S.s_filt);
+  lv_obj_add_flag(S.chart_temp, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);
+  lv_obj_add_event_cb(S.chart_temp, temp_chart_task_cb, LV_EVENT_DRAW_TASK_ADDED,
+                      NULL);
 
   S.s_deliv  = add_series(S.chart_pow, 0xa06428, a_deliv);
   S.s_ff     = add_series(S.chart_pow, UI_TEAL, a_ff);

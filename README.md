@@ -899,10 +899,13 @@ only for the delivered-watts cross-check below. The script prints:
 - with `--volume-l`, the ratio of the fitted `m·c` to the water's own `m·c`.
   A ratio well above 1 means the elements delivered fewer watts than
   `element1_watts`/`element2_watts` claim — mains below the rating voltage,
-  element resistance tolerance, SSR drop. Every watts-based quantity in bibby
-  (gains, feedforward, flux cap, the on-screen `m·c`) is off by that factor
-  until the INI ratings are corrected (measure V and R, `P = V²/R`) and the
-  test rerun;
+  element resistance tolerance, SSR drop. The gains and feedforward are still
+  correct: the controller, the log, and the fit all work in the same nominal
+  watts, so the factor cancels in the loop. Only the displayed watts, the
+  on-screen `m·c`, and the flux cap are mislabeled. If you correct the INI
+  ratings by a factor `s` (measure V and R, `P = V²/R`), scale `kp` and `ki`
+  by `s` and `process_gain_c` by `1/s`, or rerun the test — changing the
+  ratings alone makes the loop `1/s` more aggressive;
 - the FOPDT equivalents `K`, `τ`, `L`, tuned gains per rule, and the INI blocks.
 
 **Corners.** A real kettle does two things at the power transitions that a
@@ -949,9 +952,9 @@ transients of §9.4 are not in the model. Overshoot costs enzyme activity — er
 toward larger τc. Keep `kd = 0`: at 60 Hz the raw per-sample derivative mostly
 amplifies sensor noise.
 
-The shipped `bibby.ini` carries IMC-PI starting gains identified from this
-build's 2026-06-20 bench tests (~15 L, 5000+5500 W elements). **Validate on
-your own setup before trusting a batch:**
+The shipped `bibby.ini` carries SIMC-PI gains and feedforward identified from
+the 2026-09-07 heat/cool test (45 L of water, 5000+5500 W nominal elements, no
+grain). **Validate on your own setup before trusting a batch:**
 
 1. Copy the printed `[pid]` (and `[feedforward]`, §9.6) blocks into
    `bibby.ini` and restart bibby.
