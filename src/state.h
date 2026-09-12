@@ -52,7 +52,7 @@ typedef struct {
   atomic_bool     rtd_unresponsive;   // DRDY silent — sensor missing/hung
   _Atomic float   p_demand_w;
   _Atomic float   p_delivered_w;      // rolling measured output power
-  _Atomic float   mc_est_j_per_c;     // online thermal-mass estimate (0 = none yet)
+  _Atomic float   m_est_l;            // online batch-size estimate, litres of water (0 = none yet)
   _Atomic float   adaptive_scale;     // gain scale in effect (1.0 when disabled)
   atomic_bool     fault_forced_manual;// auto was blocked/kicked by a sensor fault
 

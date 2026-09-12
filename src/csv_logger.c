@@ -58,7 +58,7 @@ int csv_logger_open(CsvLogger *lg, bool high_rate, float low_period_s) {
           "wall_time,t_monotonic_s,temp_raw_c,temp_filt_c,setpoint_c,"
           "p_demand_w,p_delivered_w,duty1,duty2,flux1_w_cm2,flux2_w_cm2,"
           "pid_ff_w,pid_p_w,pid_i_w,pid_d_w,pid_integral,pid_deriv,"
-          "pid_error_c,mc_est_j_per_c,manual,grain_in,rtd_fault,watchdog\n");
+          "pid_error_c,m_est_l,manual,grain_in,rtd_fault,watchdog\n");
   fflush(lg->f);
   return 0;
 }
@@ -91,7 +91,7 @@ void csv_logger_log(CsvLogger *lg, const LogRow *row) {
           row->setpoint_c, row->p_demand_w, row->p_delivered_w,
           row->duty1, row->duty2, row->flux1_w_cm2, row->flux2_w_cm2,
           p->ff_w, p->p_w, p->i_w, p->d_w, p->integral, p->deriv,
-          p->error_c, row->mc_est_j_per_c,
+          p->error_c, row->m_est_l,
           row->manual ? 1 : 0, row->grain_in ? 1 : 0,
           (unsigned)row->rtd_fault, row->watchdog ? 1 : 0);
   fflush(lg->f);

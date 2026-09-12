@@ -10,6 +10,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include "../web/web_screen.h"
 #include "lvgl.h"
 #include "ui_screen.h"
 
@@ -142,6 +143,12 @@ int ui_run_mode(BibbyState *st, const BibbyConfig *cfg, bool test_screen) {
   } else {
     fprintf(stderr, "ui: no touch device found\n");
   }
+
+  // Second pointer device for the web mirror, fed by the queue the web threads
+  // push to. Panel coordinates, exactly like evdev above, so LVGL applies the
+  // same rotation to a remote tap as to a finger. Only present when the web
+  // server came up with remote control allowed.
+  if (cfg->web_allow_control && web_screen_available()) web_screen_attach_indev();
 
   if (test_screen) test_screen_create();
   else             ui_screen_create(st, cfg);

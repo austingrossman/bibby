@@ -11,7 +11,7 @@ struct gpiod_line_request;
 // falling edge (fresh conversion every mains-notch period, ~50/60 Hz) and on
 // each fresh sample runs: fault check -> Callendar-Van Dusen + calibration ->
 // filter -> control law (degC -> W) -> power split (W -> duties) -> publish ->
-// m*c estimator -> CSV log. Its heartbeat feeds the SSR thread's staleness
+// batch-size estimator -> CSV log. Its heartbeat feeds the SSR thread's staleness
 // watchdog, so it bumps every pass even when the sensor is dead — manual
 // control must survive sensor loss.
 typedef struct {

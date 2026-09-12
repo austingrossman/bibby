@@ -19,6 +19,10 @@ void pid_reset(Pid *pid) {
   pid->has_prev   = 0;
 }
 
+void pid_set_i_band(Pid *pid, float i_band_c) {
+  pid->i_band_c = i_band_c > 0.0f ? i_band_c : 0.0f;
+}
+
 void pid_set_gains(Pid *pid, float kp, float ki, float kd) {
   pid->kp = kp;
   pid->ki = ki;
@@ -46,7 +50,10 @@ float pid_update(Pid *pid, float temp_c, float setpoint_c, float ff_w,
   float out_pre_step = ff_w + p + pid->ki * pid->integral + d;
   int   sat_high     = out_pre_step >= out_max_w && error > 0.0f;
   int   sat_low      = out_pre_step <= 0.0f && error < 0.0f;
-  if (!sat_high && !sat_low) {
+  // Integral separation: outside the band the integrator holds. See control.h.
+  int   outside_band = pid->i_band_c > 0.0f &&
+                       (error > pid->i_band_c || error < -pid->i_band_c);
+  if (!sat_high && !sat_low && !outside_band) {
     pid->integral += error;
     // Backstop: bound the integral term to full output authority, so a long
     // saturated fault cannot wind it beyond anything the clamp can express.

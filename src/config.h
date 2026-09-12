@@ -29,6 +29,9 @@ typedef struct {
   float pid_kp;
   float pid_ki;
   float pid_kd;
+  // Integral-separation band, degC: the integrator only accumulates while
+  // |error| <= band. 0 = integrate always. Applies to both gain sets.
+  float pid_i_band_c;
 
   // [grain] — gains used while the Grain In toggle is set, plus a lower peak
   // power for the loaded kettle. grain_max_power_w = 0 means no extra cap.
@@ -69,11 +72,23 @@ typedef struct {
   char  ui_fb_device[64];
   char  ui_touch_device[64];
 
-  // [adaptive] — online thermal-mass gain scheduling. The m*c estimate is
+  // [web] — optional LAN web interface (mirrors the panel, serves the logs).
+  // Disabled unless web_password is non-empty: the server refuses to bind
+  // without one, so an unconfigured unit is never reachable. web_allow_control
+  // false makes the mirror read-only (no pointer injection into the UI).
+  bool  web_enable;
+  int   web_port;
+  char  web_bind[64];          // "0.0.0.0" (LAN) or "127.0.0.1" (local only)
+  char  web_user[64];
+  char  web_password[128];
+  bool  web_allow_control;
+  int   web_screen_fps;        // screen-mirror capture rate cap, 1..30
+
+  // [adaptive] — online batch-size gain scheduling. The litres estimate is
   // always computed and logged; only when enable=true does it scale kp/kd by
-  // (mc_est / mc_ref_j_per_c), clamped to [scale_min, scale_max].
+  // (m_est / m_ref_l), clamped to [scale_min, scale_max].
   bool  adaptive_enable;
-  float adaptive_mc_ref_j_per_c;
+  float adaptive_m_ref_l;
   float adaptive_scale_min;
   float adaptive_scale_max;
 } BibbyConfig;

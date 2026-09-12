@@ -11,6 +11,15 @@
 //
 // A holding feedforward in watts may be passed in ahead of the feedback terms
 // (see control_feedforward_w); the feedback then only trims model error.
+//
+// Integral separation: when i_band_c > 0 the integrator only accumulates
+// while |error| <= i_band_c and holds (keeps its value, neither grows nor
+// resets) outside that band. The kettle is an integrating plant, so error
+// accumulated during a long approach must be paid back as overshoot after the
+// crossing; with the feedforward carrying the holding power the integrator
+// has only a few tens of watts to trim, and there is nothing useful for it to
+// learn while the temperature is still degrees away. i_band_c = 0 integrates
+// always (the classic PI).
 
 // Breakdown of the most recent update, for logging/tuning/chart.
 typedef struct {
@@ -26,6 +35,7 @@ typedef struct {
 
 typedef struct {
   float kp, ki, kd;
+  float i_band_c;   // integral-separation band, degC; 0 = integrate always
   float integral;
   float prev_error;
   int   has_prev;
@@ -33,6 +43,10 @@ typedef struct {
 } Pid;
 
 void pid_init(Pid *pid, float kp, float ki, float kd);
+
+// Set the integral-separation band (degC, 0 = off). Kept across
+// pid_set_gains(): the band is a property of the approach, not the gain set.
+void pid_set_i_band(Pid *pid, float i_band_c);
 
 // Clear the integrator and derivative history (on mode or gain-set change).
 void pid_reset(Pid *pid);

@@ -7,7 +7,7 @@
 
 #include "config.h"
 #include "control.h"
-#include "mc_estimator.h"
+#include "mass_estimator.h"
 #include "power_split.h"
 #include "sigma_delta.h"
 #include "temp_filter.h"
@@ -138,6 +138,23 @@ static void test_control(void) {
   for (int i = 0; i < 100000; i++) pid_update(&pid, 64.9f, 65, 0, 1000, 1.0f);
   CHECK(pid.terms.i_w <= 1000.0f + 1e-3);
 
+  // Integral separation: outside the band the integrator holds; inside it
+  // accumulates; a gain-set swap keeps the band.
+  pid_init(&pid, 0, 10.0f, 0);
+  pid_set_i_band(&pid, 0.5f);
+  pid_update(&pid, 60, 65, 0, 10000, 1.0f);   // error 5 > band: hold
+  CHECK(pid.integral == 0.0f);
+  pid_update(&pid, 64.7f, 65, 0, 10000, 1.0f); // error 0.3 <= band: accumulate
+  CHECK_NEAR(pid.integral, 0.3, 1e-4);
+  pid_update(&pid, 66, 65, 0, 10000, 1.0f);   // error -1 outside: hold, no reset
+  CHECK_NEAR(pid.integral, 0.3, 1e-4);
+  pid_set_gains(&pid, 0, 5.0f, 0);
+  CHECK_NEAR(pid.i_band_c, 0.5, 1e-6);
+  pid_set_i_band(&pid, -1.0f);                 // negative clamps to off
+  CHECK(pid.i_band_c == 0.0f);
+  pid_update(&pid, 60, 65, 0, 10000, 1.0f);   // band off: integrates again
+  CHECK_NEAR(pid.integral, 5.0, 1e-4);
+
   // Derivative: kd * per-sample error delta; no kick on the first sample.
   pid_init(&pid, 0, 0, 50);
   pid_update(&pid, 60, 65, 0, 10000, 1.0f);
@@ -183,35 +200,37 @@ static void test_temp_filter(void) {
   temp_filter_free(&f);
 }
 
-// ── mc_estimator ─────────────────────────────────────────────────────────────
+// ── mass_estimator ───────────────────────────────────────────────────────────
 
-static void test_mc_estimator(void) {
-  // Constant 3000 W into mc = 60 kJ/degC: slope 0.05 degC/s. Feed 5 minutes
-  // at 10 Hz; the estimate should converge near 60000.
-  McEstimator e;
-  mc_estimator_init(&e, 200.0f);
-  double mc_true = 60000.0;
+static void test_mass_estimator(void) {
+  // Constant 3000 W into 20 L of water (m*c = 83.72 kJ/degC): slope
+  // 0.03583 degC/s. Feed 5 minutes at 10 Hz; the estimate should converge
+  // near 20 L.
+  MassEstimator e;
+  mass_estimator_init(&e, 200.0f);
+  double litres_true = 20.0;
+  double mc_true = litres_true * WATER_C_J_PER_KG_C;
   for (int i = 0; i < 3000; i++) {
     double t = i * 0.1;
-    mc_estimator_push(&e, t, (float)(20.0 + 3000.0 / mc_true * t), 3000.0f);
+    mass_estimator_push(&e, t, (float)(20.0 + 3000.0 / mc_true * t), 3000.0f);
   }
-  CHECK(mc_estimator_value(&e) > 0);
-  CHECK_NEAR(mc_estimator_value(&e), mc_true, mc_true * 0.05);
+  CHECK(mass_estimator_value(&e) > 0);
+  CHECK_NEAR(mass_estimator_value(&e), litres_true, litres_true * 0.05);
 
   // Wildly varying power: no estimate accepted.
-  mc_estimator_init(&e, 200.0f);
+  mass_estimator_init(&e, 200.0f);
   for (int i = 0; i < 3000; i++) {
     double t = i * 0.1;
     float p = (i / 100) % 2 ? 4000.0f : 500.0f;
-    mc_estimator_push(&e, t, (float)(20.0 + 0.03 * t), p);
+    mass_estimator_push(&e, t, (float)(20.0 + 0.03 * t), p);
   }
-  CHECK(mc_estimator_value(&e) == 0.0f);
+  CHECK(mass_estimator_value(&e) == 0.0f);
 
   // Power below the floor: no estimate.
-  mc_estimator_init(&e, 200.0f);
+  mass_estimator_init(&e, 200.0f);
   for (int i = 0; i < 3000; i++)
-    mc_estimator_push(&e, i * 0.1, (float)(20.0 + 0.05 * i * 0.1), 100.0f);
-  CHECK(mc_estimator_value(&e) == 0.0f);
+    mass_estimator_push(&e, i * 0.1, (float)(20.0 + 0.05 * i * 0.1), 100.0f);
+  CHECK(mass_estimator_value(&e) == 0.0f);
 }
 
 // ── config ───────────────────────────────────────────────────────────────────
@@ -223,6 +242,7 @@ static void test_config(void) {
   CHECK(!config_load(&cfg, "/nonexistent/bibby.ini"));
   CHECK(cfg.mains_hz == 60);
   CHECK(cfg.pid_kp == 0.0f);
+  CHECK(cfg.pid_i_band_c == 0.0f);
   CHECK(cfg.log_high_rate);
   CHECK(cfg.ui_show_zc_sim);
   CHECK(cfg.ui_rotation == 90);
@@ -243,14 +263,14 @@ static void test_config(void) {
     "[element1]\nwatts = 5000 ; comment\narea_cm2 = 820\n"
     "[element2]\nwatts = 5500\narea_cm2 = 473\n"
     "[power]\nmax_flux_w_cm2 = 4.5\n"
-    "[pid]\nkp = 350\nki = 0.02\nkd = 10\n"
+    "[pid]\nkp = 350\nki = 0.02\nkd = 10\ni_band_c = 0.75\n"
     "[grain]\nkp = 200\nki = 0.01\nkd = 5\nmax_power_w = 6000\n"
     "[feedforward]\nprocess_gain_c = 0.011\nambient_c = 18\n"
     "[sensor]\nref_resistor_ohms = 397.82\ntemp_cal_gain = 1.0528\ntemp_cal_offset = -0.032\n"
     "[filter]\norder = 3\nwindow = 20\n"
     "[logging]\nrate = low\nlow_period_s = 1.5\n"
     "[ui]\nshow_zc_sim = false\nchart_window_min = 10\nrotation = 270\nfb_device = /dev/fb1\ntouch_device = /dev/input/event1\n"
-    "[adaptive]\nenable = true\nmc_ref_j_per_c = 60000\nscale_min = 0.6\nscale_max = 3\n");
+    "[adaptive]\nenable = true\nm_ref_l = 45\nscale_min = 0.6\nscale_max = 3\n");
   fclose(f);
 
   CHECK(config_load(&cfg, path));
@@ -259,6 +279,7 @@ static void test_config(void) {
   CHECK_NEAR(cfg.element2_area_cm2, 473, 1e-6);
   CHECK_NEAR(cfg.max_flux_w_cm2, 4.5, 1e-6);
   CHECK_NEAR(cfg.pid_kp, 350, 1e-6);
+  CHECK_NEAR(cfg.pid_i_band_c, 0.75, 1e-6);
   CHECK_NEAR(cfg.grain_max_power_w, 6000, 1e-6);
   CHECK_NEAR(cfg.ff_process_gain_c, 0.011, 1e-9);
   CHECK_NEAR(cfg.sensor_ref_resistor_ohms, 397.82, 1e-4);
@@ -270,7 +291,7 @@ static void test_config(void) {
   CHECK(!strcmp(cfg.ui_fb_device, "/dev/fb1"));
   CHECK(!strcmp(cfg.ui_touch_device, "/dev/input/event1"));
   CHECK(cfg.adaptive_enable);
-  CHECK_NEAR(cfg.adaptive_mc_ref_j_per_c, 60000, 1e-3);
+  CHECK_NEAR(cfg.adaptive_m_ref_l, 45, 1e-3);
   CHECK_NEAR(config_total_watts(&cfg), 10500, 1e-3);
   remove(path);
 }
@@ -280,7 +301,7 @@ int main(void) {
   test_sigma_delta();
   test_control();
   test_temp_filter();
-  test_mc_estimator();
+  test_mass_estimator();
   test_config();
 
   if (failures) {

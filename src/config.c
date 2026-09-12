@@ -38,8 +38,16 @@ static void set_defaults(BibbyConfig *cfg) {
   cfg->ui_rotation       = 90;
   snprintf(cfg->ui_fb_device,    sizeof(cfg->ui_fb_device),    "auto");
   snprintf(cfg->ui_touch_device, sizeof(cfg->ui_touch_device), "auto");
+  cfg->web_enable        = false;  // off until a password is set in bibby.ini
+  cfg->web_port          = 8080;
+  cfg->web_allow_control = true;
+  cfg->web_screen_fps    = 5;
+  snprintf(cfg->web_bind,     sizeof(cfg->web_bind),     "0.0.0.0");
+  snprintf(cfg->web_user,     sizeof(cfg->web_user),     "brewer");
+  cfg->web_password[0]   = '\0';   // empty = server refuses to start
+  cfg->pid_i_band_c           = 0.0f;   // off: classic PI until the ini sets it
   cfg->adaptive_enable        = false;
-  cfg->adaptive_mc_ref_j_per_c = 0.0f;
+  cfg->adaptive_m_ref_l       = 0.0f;
   cfg->adaptive_scale_min     = 0.5f;
   cfg->adaptive_scale_max     = 4.0f;
 }
@@ -70,6 +78,7 @@ static void apply(BibbyConfig *cfg, const char *key, const char *val) {
   else if (!strcmp(key, "pid.kp"))             cfg->pid_kp            = (float)atof(val);
   else if (!strcmp(key, "pid.ki"))             cfg->pid_ki            = (float)atof(val);
   else if (!strcmp(key, "pid.kd"))             cfg->pid_kd            = (float)atof(val);
+  else if (!strcmp(key, "pid.i_band_c"))       cfg->pid_i_band_c      = (float)atof(val);
   else if (!strcmp(key, "grain.kp"))           cfg->grain_kp          = (float)atof(val);
   else if (!strcmp(key, "grain.ki"))           cfg->grain_ki          = (float)atof(val);
   else if (!strcmp(key, "grain.kd"))           cfg->grain_kd          = (float)atof(val);
@@ -88,8 +97,15 @@ static void apply(BibbyConfig *cfg, const char *key, const char *val) {
   else if (!strcmp(key, "ui.rotation"))        cfg->ui_rotation       = atoi(val);
   else if (!strcmp(key, "ui.fb_device"))       snprintf(cfg->ui_fb_device, sizeof(cfg->ui_fb_device), "%s", val);
   else if (!strcmp(key, "ui.touch_device"))    snprintf(cfg->ui_touch_device, sizeof(cfg->ui_touch_device), "%s", val);
+  else if (!strcmp(key, "web.enable"))          cfg->web_enable        = parse_bool(val);
+  else if (!strcmp(key, "web.port"))            cfg->web_port          = atoi(val);
+  else if (!strcmp(key, "web.bind"))            snprintf(cfg->web_bind,     sizeof(cfg->web_bind),     "%s", val);
+  else if (!strcmp(key, "web.user"))            snprintf(cfg->web_user,     sizeof(cfg->web_user),     "%s", val);
+  else if (!strcmp(key, "web.password"))        snprintf(cfg->web_password, sizeof(cfg->web_password), "%s", val);
+  else if (!strcmp(key, "web.allow_control"))   cfg->web_allow_control = parse_bool(val);
+  else if (!strcmp(key, "web.screen_fps"))      cfg->web_screen_fps    = atoi(val);
   else if (!strcmp(key, "adaptive.enable"))    cfg->adaptive_enable   = parse_bool(val);
-  else if (!strcmp(key, "adaptive.mc_ref_j_per_c")) cfg->adaptive_mc_ref_j_per_c = (float)atof(val);
+  else if (!strcmp(key, "adaptive.m_ref_l"))   cfg->adaptive_m_ref_l   = (float)atof(val);
   else if (!strcmp(key, "adaptive.scale_min")) cfg->adaptive_scale_min = (float)atof(val);
   else if (!strcmp(key, "adaptive.scale_max")) cfg->adaptive_scale_max = (float)atof(val);
 }

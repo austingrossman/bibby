@@ -478,12 +478,12 @@ static void refresh_cb(lv_timer_t *t) {
     lv_obj_add_flag(S.fault_band, LV_OBJ_FLAG_HIDDEN);
   }
 
-  // Status line: adaptive estimate and gain scale.
-  float mc = atomic_load(&ST->mc_est_j_per_c);
+  // Status line: batch-size estimate (litres of water) and gain scale.
+  float m_l = atomic_load(&ST->m_est_l);
   float scale = atomic_load(&ST->adaptive_scale);
-  if (mc > 0.0f) {
-    snprintf(txt, sizeof(txt), "mc %.0f kJ/°C  x%.2f",
-             (double)(mc / 1000.0f), (double)scale);
+  if (m_l > 0.0f) {
+    snprintf(txt, sizeof(txt), "m %.1f L  x%.2f",
+             (double)m_l, (double)scale);
     lv_label_set_text(S.lbl_status, txt);
   } else {
     lv_label_set_text(S.lbl_status, "");

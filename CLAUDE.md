@@ -2,7 +2,8 @@
 
 Embedded temperature/power controller running on Raspberry Pi 5. **One process,
 three threads** — `bibby` (C11) does SSR firing, RTD sampling, the control law, the
-touchscreen UI, and CSV logging. The earlier two-process split (frontend +
+touchscreen UI, and CSV logging. An optional web interface (`src/web/`, off by
+default) adds a few more threads that are not on the control path. The earlier two-process split (frontend +
 heater-controller over POSIX shared memory, SDL3/ImGui UI) is gone; the plan that
 rebuild followed is in `docs/REBUILD.md`. README §2 has the architecture diagrams.
 
@@ -45,7 +46,7 @@ Everything paced by the RTD conversion rate; one pass = heartbeat + read + contr
 - Grain In swaps the gain set (`[grain]`) and optionally lowers peak power.
 - Manual publishes duty every pass (a dead sensor must not freeze the slider); auto runs the
   control law once per fresh sample.
-- Slow tick (0.5 s): measured delivered power from the fired counters, m·c estimate, chart
+- Slow tick (0.5 s): measured delivered power from the fired counters, batch-size estimate, chart
   history push (~2 Hz into the `HISTORY_CAP` ring).
 - Logging: one CSV row per fresh sample; during a fault, one row per slow tick so the outage
   and its fault bits stay on disk.
@@ -67,11 +68,49 @@ Everything paced by the RTD conversion rate; one pass = heartbeat + read + contr
 - Screen: kettle card (setpoint, °C/°F, per-element duty), POWER slider (commands watts in
   manual, read-only live demand in auto), ±10/±1/±0.1 setpoint steppers, ZC Sim / Grain In /
   Manual Control toggles, temperature chart, power chart (demand/delivered/ff/P/I/D), fault
-  band, m·c + adaptive-scale status line. Refresh timer at 250 ms, charts every other tick.
+  band, batch-size (`m xx.x L`) + adaptive-scale status line. Refresh timer at 250 ms, charts
+  every other tick.
 - Each chart carries a row of legend chips; tapping one hides that trace and drops it from
   that chart's autoscale (`vis[]` / `trace[]` in `ui_screen.c`). All traces start visible.
 - **The UI owns no control or safety logic.** It reads the state snapshot and writes only
   `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in`, `simulate_zc`.
+
+### web — `src/web/` (optional, off by default)
+Enabled only by `[web]` in `bibby.ini` **with a password set**; the server refuses to
+start with an empty one. Adds an accept thread, a framebuffer-capture thread, and a
+detached thread per HTTP connection (cap 16), all SCHED_OTHER. Two screens in one
+embedded HTML page: a live mirror of the panel that can be tapped, and a browser for
+the CSV logs (plots, download).
+- `web.{h,c}` = server lifecycle, Basic auth, routing. `http.{h,c}` = request parsing,
+  responses, base64/percent decoding, a growable `Buf`. `web_screen.{h,c}` = fb mirror
+  + PNG + pointer queue + the LVGL indev. `web_logs.{h,c}` = listing, path validation,
+  CSV decimation. `www/index.html` is the whole UI, embedded by `cmake/embed_asset.cmake`
+  into `web_index_html[]` at build time (so an installed binary needs no asset files).
+- **Mirror:** `mmap`s `/dev/fb0` read-only, memcmp against the previous frame, and only
+  bumps a frame sequence on a real pixel change. Captures at most `web.screen_fps` and
+  only while a browser is waiting. `/api/screen.png?seq=N` long-polls (10 s, then 204),
+  so a static screen is free. PNG = zlib + "Up" filter; `?scale=2` halves each axis.
+  The image is un-rotated by `ui.rotation` so the browser shows the operator's view.
+- **Input:** `/api/input` takes `x,y,state` in *display* coordinates,
+  `panel_from_display()` maps them back to panel coordinates, and a queue feeds a
+  **second LVGL pointer indev** created on the UI thread (`web_screen_attach_indev()`,
+  called from `ui.c`). Same coordinate space and same rotation handling as evdev, so a
+  remote tap is indistinguishable from a finger. **LVGL is single-threaded: that queue
+  is the only boundary — never call `lv_*` from a web thread.** A press with no
+  follow-up is auto-released after 2 s.
+- **The web layer owns no control or safety logic**, exactly like the UI. Everything it
+  can do, it does by pressing the same widgets. `web.allow_control = false` drops the
+  indev entirely (read-only mirror).
+- **Logs:** `/api/logs` walks `~/bibby/logs`; `/api/log` streams one CSV through a
+  bounded-memory decimator (buckets merge pairwise and rows-per-bucket doubles when the
+  array fills) to <= `points` samples per series; `/api/log/download` serves the raw
+  file. Every client path is `realpath()`d and must land inside the log root and end in
+  `.csv`. Also `/api/info` and `/api/state` (live JSON snapshot).
+- **Cost (Pi 5, 1280x720):** ~19 ms/frame full-res, ~8 ms at `scale=2`; linear in
+  `web.screen_fps` (~11 % of one core at 5 fps, ~5 % at 2 fps, vs ~1.4 % idle). Nothing
+  when nobody is watching. The un-rotate dominates, not zlib — it precomputes per-pixel
+  and per-row byte steps (`display_walk()`) rather than transforming each pixel, which
+  is worth ~10x, and it needs the optimized build to pay off.
 
 ## Control chain — the units matter
 `°C error → watts → duty → fired half-cycles`. Duty is an *actuator* command, not a control
@@ -82,14 +121,21 @@ quantity; it appears for the first time in the power split.
   `(setpoint − ambient)/K` watts is added ahead of the feedback, so the PID only trims model
   error. Conditional-integration anti-windup (hold the integrator when the pre-step output is
   already railed and the error pushes further in), plus an integral backstop of
-  `out_max_w / ki`. `PidTerms` carries the per-term breakdown for logging/charts.
+  `out_max_w / ki`. **Integral separation** (`pid.i_band_c`, °C): the integrator also holds
+  while `|error|` is outside the band — the kettle is an integrating plant, so error soaked
+  up during the approach is repaid as overshoot after the crossing (the whole 0.73 °C of the
+  2026-09-07 ramp test); with feedforward carrying the holding power there is nothing for it
+  to learn until the loop is close. 0 = integrate always. `PidTerms` carries the per-term
+  breakdown for logging/charts.
 - `src/power_split.{h,c}` — splits the watts demand across the two elements at **equal
   surface flux** (anti-scorch), pushing overflow to the other element when one saturates.
   `power.max_flux_w_cm2 > 0` caps total demand at `flux × (A1 + A2)`. E1% and E2% differ by
   design.
-- `src/mc_estimator.{h,c}` — online thermal mass: over a stretch of roughly constant
-  delivered power with ≥1 °C rise, `m·c = P / (dT/dt)` in J/°C (≈ batch size). Always
-  computed and logged; only `[adaptive]` decides whether it scales `kp`/`kd`.
+- `src/mass_estimator.{h,c}` — online batch size: over a stretch of roughly constant
+  delivered power with ≥1 °C rise, thermal mass `P / (dT/dt)` in J/°C, reported as litres of
+  water `m = (P / slope) / 4186`. Reads high by the kettle's own mass and by 1/(delivered ÷
+  rated watts). Always computed and logged (`m_est_l`); only `[adaptive]` (`m_ref_l`) decides
+  whether it scales `kp`/`kd`.
 - `src/temp_filter.{h,c}` — cascaded boxcar, `filter.order` stages × `filter.window` samples.
   Group delay `order*(window−1)/2` samples feeds the dead-time term used for tuning.
 
@@ -108,7 +154,7 @@ chart history ring.
 | `zc_count`, `fired1`, `fired2` | ssr | sampler | delivered-power measurement |
 | `temp_raw_c`, `temp_filt_c`, `temp_valid` | sampler | ui | temperature |
 | `rtd_fault`, `rtd_unresponsive` | sampler | ui | MAX31865 fault bits / silent DRDY |
-| `p_demand_w`, `p_delivered_w`, `mc_est_j_per_c`, `adaptive_scale` | sampler | ui | loop telemetry |
+| `p_demand_w`, `p_delivered_w`, `m_est_l`, `adaptive_scale` | sampler | ui | loop telemetry |
 | `fault_forced_manual` | sampler | ui | auto was blocked/kicked by a sensor fault |
 | `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in` | ui | sampler | operator commands |
 | `running` | any | all | clear to shut the process down |
@@ -120,12 +166,13 @@ chart history ring.
 - Every row is `fflush`ed so a crash mid-brew keeps the data on disk.
 - Columns: `wall_time, t_monotonic_s, temp_raw_c, temp_filt_c, setpoint_c, p_demand_w,
   p_delivered_w, duty1, duty2, flux1_w_cm2, flux2_w_cm2, pid_ff_w, pid_p_w, pid_i_w,
-  pid_d_w, pid_integral, pid_deriv, pid_error_c, mc_est_j_per_c, manual, grain_in,
+  pid_d_w, pid_integral, pid_deriv, pid_error_c, m_est_l, manual, grain_in,
   rtd_fault, watchdog`. `wall_time` is ISO-8601 local with ms; there is no `dt` column —
   recover time from `wall_time` or `t_monotonic_s`.
 - `tools/plot_logs.py` browses/plots the logs; `tools/identify_plant.py` drives the lumped
-  kettle model with the logged `p_delivered_w` and fits m·c, k_loss, L by least squares
+  kettle model with the logged `p_delivered_w` and fits m (litres), k_loss, L by least squares
   (heat-then-cool test, whole log, `--ambient` required), then prints PID/feedforward blocks.
+  `--lambda` sets SIMC's τc (README §9.5); the shipped gains use τc = 30 s.
 
 ## MAX31865 Sensor — `src/max31865.{h,c}`
 - PT100, 3-wire, continuous conversion → a fresh sample every mains-notch period (~50/60 Hz).
@@ -165,7 +212,9 @@ chart history ring.
   `config_resolved_path()` reports which one was used; startup logs it.
 - INI format: `[section]` headers, `key = value`, `#`/`;` comments (inline too). Sections:
   `[mains] [element1] [element2] [power] [pid] [grain] [feedforward] [sensor] [filter]
-  [logging] [ui] [adaptive]`. README §7 has the full key table with defaults.
+  [logging] [ui] [web] [adaptive]`. README §7 has the full key table with defaults.
+  Because `#`/`;` start a comment anywhere on a line, `web.password` may not contain
+  either character.
 - Derived helpers: `config_zc_timeout_ns()` = half-period + 0.7 ms guard (60 Hz → 9.0 ms,
   50 Hz → 10.7 ms); `config_staleness_zc()` = `2*hz` (~2 s); `config_total_watts()` = P1+P2,
   the control-law output clamp before the flux cap.
@@ -174,10 +223,14 @@ chart history ring.
   and in README §9.
 
 ## Build and tests
-CMake, C11, `-Wall -Wextra`. LVGL v9.3.0 via FetchContent (`src/ui/lv_conf.h` is the config).
-Two targets: `bibby` (links `lvgl`, `gpiod`, `m`, `pthread`, `rt`) and `tests`
+CMake, C11, `-Wall -Wextra`. **`CMAKE_BUILD_TYPE` defaults to `RelWithDebInfo` when
+unset** — CMake's own default is no `-O` at all, which runs LVGL's renderer and the web
+mirror ~4x slower. A build dir keeps the type it was first configured with, so check
+`grep C_FLAGS build/CMakeFiles/bibby.dir/flags.make` before benchmarking anything.
+LVGL v9.3.0 via FetchContent (`src/ui/lv_conf.h` is the config).
+Two targets: `bibby` (links `lvgl`, `gpiod`, `z`, `m`, `pthread`, `rt`) and `tests`
 (`tests/test_units.c` + the pure modules — power split, sigma-delta, control, temp filter,
-m·c estimator, config; no hardware, no LVGL).
+batch-size estimator, config; no hardware, no LVGL).
 `build/` and `logs/` are gitignored. `bibby.ini` and `deploy/bibby.service` are checked in.
 
 ## Development workflow (Austin's setup — environment-specific, not a build requirement)
@@ -227,6 +280,11 @@ whenever the Pi is reachable, and no-ops silently when the Pi is powered off.
   yet — automatic control may not command power; the sampler forces manual at 0 W, sets
   `fault_forced_manual`, and the UI shows why. Only manual control may drive the SSRs then.
 - One instance only: the flock guard keeps a second `bibby` from fighting over the SSR lines.
+- Remote control (`src/web/`) may not bypass any of the above. It is off by default,
+  needs a password, and acts only by injecting pointer events into the UI's own widgets,
+  so every interlock and clamp applies unchanged. It is plain HTTP on the LAN — the
+  password is the only authorization, so README §8 tells the operator to keep it off the
+  open internet and offers `bind = 127.0.0.1` + an ssh tunnel instead.
 
 ## Configurability
 - There shall be an ini file that configures key parameters that another person/setp would need.

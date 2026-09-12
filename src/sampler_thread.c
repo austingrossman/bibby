@@ -5,7 +5,7 @@
 #include <stdlib.h>
 
 #include "control.h"
-#include "mc_estimator.h"
+#include "mass_estimator.h"
 #include "power_split.h"
 #include "temp_filter.h"
 
@@ -65,10 +65,11 @@ void *sampler_thread_main(void *arg) {
 
   Pid pid;
   pid_init(&pid, cfg->pid_kp, cfg->pid_ki, cfg->pid_kd);
+  pid_set_i_band(&pid, cfg->pid_i_band_c);
 
-  McEstimator mc;
+  MassEstimator mass;
   // Ignore rise windows below 10% of rated power — too little signal.
-  mc_estimator_init(&mc, 0.10f * config_total_watts(cfg));
+  mass_estimator_init(&mass, 0.10f * config_total_watts(cfg));
 
   struct gpiod_edge_event_buffer *event_buf = gpiod_edge_event_buffer_new(4);
   if (!event_buf) {
@@ -168,11 +169,11 @@ void *sampler_thread_main(void *arg) {
     if (grain && cfg->grain_max_power_w > 0.0f && cfg->grain_max_power_w < out_max_w)
       out_max_w = cfg->grain_max_power_w;
 
-    // Adaptive thermal-mass gain schedule (config-gated; estimate always runs).
+    // Adaptive batch-size gain schedule (config-gated; estimate always runs).
     float scale = 1.0f;
-    float mc_est = mc_estimator_value(&mc);
-    if (cfg->adaptive_enable && cfg->adaptive_mc_ref_j_per_c > 0.0f && mc_est > 0.0f)
-      scale = clampf(mc_est / cfg->adaptive_mc_ref_j_per_c,
+    float m_est = mass_estimator_value(&mass);
+    if (cfg->adaptive_enable && cfg->adaptive_m_ref_l > 0.0f && m_est > 0.0f)
+      scale = clampf(m_est / cfg->adaptive_m_ref_l,
                      cfg->adaptive_scale_min, cfg->adaptive_scale_max);
     atomic_store(&st->adaptive_scale, scale);
 
@@ -202,12 +203,12 @@ void *sampler_thread_main(void *arg) {
       atomic_store(&st->duty2, split.duty2);
     }
 
-    // ── Slow tick: delivered power, m*c estimate, chart history ──────────
+    // ── Slow tick: delivered power, batch-size estimate, chart history ───
     if (now - last_slow_t >= SLOW_TICK_S) {
       last_slow_t = now;
       p_delivered = delivered_power_w(st, cfg, &fired_prev);
       atomic_store(&st->p_delivered_w, p_delivered);
-      atomic_store(&st->mc_est_j_per_c, mc_est);
+      atomic_store(&st->m_est_l, m_est);
 
       HistPoint pt = {
         .t_s         = (float)now,
@@ -231,7 +232,7 @@ void *sampler_thread_main(void *arg) {
     // one row per slow tick so the outage and its fault bits stay on disk.
     bool log_now = fresh || (now - last_fresh_t > SLOW_TICK_S &&
                              now - last_log_t >= SLOW_TICK_S);
-    if (fresh) mc_estimator_push(&mc, now, temp_filt, p_delivered);
+    if (fresh) mass_estimator_push(&mass, now, temp_filt, p_delivered);
     if (log_now) {
       last_log_t = now;
 
@@ -245,7 +246,7 @@ void *sampler_thread_main(void *arg) {
         .duty1 = split.duty1, .duty2 = split.duty2,
         .flux1_w_cm2 = split.flux1_w_cm2, .flux2_w_cm2 = split.flux2_w_cm2,
         .pid = pid.terms,
-        .mc_est_j_per_c = mc_est,
+        .m_est_l   = m_est,
         .manual    = manual,
         .grain_in  = grain,
         .rtd_fault = atomic_load(&st->rtd_fault),

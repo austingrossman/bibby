@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>bibby</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#1a2027; --panel-hi:#2a323d; --border:#39434f;
+    --text:#e8ecf1; --dim:#9aa4b0; --green:#37c871; --amber:#ffb020;
+    --red:#ff4b3e; --blue:#4aa8ff; --violet:#b07aff; --teal:#2fd4c4;
+    --orange:#ff8c2e; --trace:#50c8ff;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       display:flex;flex-direction:column;overflow:hidden}
+  header{display:flex;align-items:center;gap:14px;padding:8px 14px;
+         background:var(--panel);border-bottom:1px solid var(--border);flex:none}
+  .brand{font-weight:700;letter-spacing:.06em;font-size:15px}
+  .brand span{color:var(--trace)}
+  nav{display:flex;gap:4px}
+  nav button{background:transparent;border:1px solid transparent;color:var(--dim);
+             padding:5px 12px;border-radius:7px;cursor:pointer;font:inherit;font-weight:600}
+  nav button:hover{color:var(--text);background:var(--panel-hi)}
+  nav button[aria-selected=true]{background:var(--panel-hi);color:var(--text);
+                                 border-color:var(--border)}
+  .spacer{flex:1}
+  .pill{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--border);
+        color:var(--dim);white-space:nowrap}
+  .pill.ok{color:var(--green);border-color:#26543c}
+  .pill.warn{color:var(--amber);border-color:#5c4415}
+  .pill.err{color:var(--red);border-color:#5e2320}
+  main{flex:1;min-height:0;position:relative}
+  section.view{position:absolute;inset:0;display:none}
+  section.view.on{display:flex}
+
+  /* ── Screen mirror ───────────────────────────────────────────────────── */
+  #view-screen{align-items:center;justify-content:center;flex-direction:column;
+               gap:10px;padding:12px}
+  #screenwrap{position:relative;flex:1;min-height:0;display:flex;
+              align-items:center;justify-content:center;width:100%}
+  #screen{max-width:100%;max-height:100%;border-radius:10px;
+          border:1px solid var(--border);background:#000;touch-action:none;
+          image-rendering:auto;-webkit-user-select:none;user-select:none;
+          -webkit-user-drag:none;cursor:crosshair}
+  #screen.readonly{cursor:not-allowed}
+  #screen.stale{opacity:.45;transition:opacity .2s}
+  #screenmsg{position:absolute;color:var(--dim);font-size:13px;text-align:center;
+             padding:20px;max-width:32em}
+  .screenbar{display:flex;gap:10px;align-items:center;color:var(--dim);font-size:12px;
+             flex-wrap:wrap;justify-content:center}
+  .screenbar label{display:flex;gap:5px;align-items:center;cursor:pointer}
+  select,input[type=number]{background:var(--panel);color:var(--text);font:inherit;
+        border:1px solid var(--border);border-radius:6px;padding:3px 6px}
+
+  /* ── Logs ────────────────────────────────────────────────────────────── */
+  #view-logs{flex-direction:row}
+  #loglist{width:250px;flex:none;border-right:1px solid var(--border);
+           display:flex;flex-direction:column;background:var(--panel)}
+  .listhead{padding:9px 12px;font-size:11px;letter-spacing:.09em;text-transform:uppercase;
+            color:var(--dim);border-bottom:1px solid var(--border);
+            display:flex;align-items:center;gap:8px}
+  .listhead button{margin-left:auto;background:transparent;border:1px solid var(--border);
+            color:var(--dim);border-radius:6px;cursor:pointer;font:inherit;font-size:11px;
+            padding:2px 7px}
+  #logitems{overflow-y:auto;flex:1}
+  .logitem{padding:8px 12px;border-bottom:1px solid #222a33;cursor:pointer}
+  .logitem:hover{background:var(--panel-hi)}
+  .logitem[aria-selected=true]{background:#20303f;box-shadow:inset 3px 0 0 var(--trace)}
+  .logitem .n{font-weight:600;font-size:13px;
+              font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .logitem .s{color:var(--dim);font-size:11px;display:flex;gap:6px;align-items:center}
+  .live{color:var(--green);font-weight:700}
+  #logmain{flex:1;min-width:0;display:flex;flex-direction:column;padding:12px;gap:10px;
+           overflow-y:auto}
+  .logbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;color:var(--dim);
+          font-size:12px}
+  .logbar .title{color:var(--text);font-weight:600;font-size:14px;
+                 font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  a.dl{margin-left:auto;background:var(--panel);border:1px solid var(--border);
+       color:var(--text);padding:5px 12px;border-radius:7px;text-decoration:none;
+       font-size:12px;font-weight:600;white-space:nowrap}
+  a.dl:hover{background:var(--panel-hi);border-color:var(--trace)}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+        padding:10px 12px 6px}
+  .legend{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+  .chip{display:flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;
+        border-radius:999px;border:1px solid var(--border);color:var(--dim);
+        cursor:pointer;user-select:none;background:#141a20}
+  .chip .sw{width:9px;height:9px;border-radius:2px}
+  .chip[aria-pressed=false]{opacity:.38}
+  .chip:hover{border-color:var(--dim)}
+  canvas{width:100%;display:block;touch-action:pan-y}
+  .empty{color:var(--dim);padding:28px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">bib<span>by</span></div>
+  <nav>
+    <button id="tab-screen" aria-selected="true">Screen</button>
+    <button id="tab-logs" aria-selected="false">Logs</button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="pill" id="status">connecting…</div>
+</header>
+
+<main>
+  <section class="view on" id="view-screen">
+    <div id="screenwrap">
+      <img id="screen" alt="bibby panel">
+      <div id="screenmsg">connecting to the panel…</div>
+    </div>
+    <div class="screenbar">
+      <span id="screeninfo"></span>
+      <label>quality
+        <select id="scale">
+          <option value="1">full</option>
+          <option value="2">half (slow links)</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <section class="view" id="view-logs">
+    <aside id="loglist">
+      <div class="listhead">Run logs <button id="reload">refresh</button></div>
+      <div id="logitems"><div class="empty">loading…</div></div>
+    </aside>
+    <div id="logmain">
+      <div class="logbar">
+        <span class="title" id="logtitle">Select a log</span>
+        <span id="logmeta"></span>
+        <a class="dl" id="download" hidden>Download CSV</a>
+      </div>
+      <div class="card" id="card-temp" hidden>
+        <div class="legend" id="leg-temp"></div>
+        <canvas id="chart-temp" height="260"></canvas>
+      </div>
+      <div class="card" id="card-pow" hidden>
+        <div class="legend" id="leg-pow"></div>
+        <canvas id="chart-pow" height="260"></canvas>
+      </div>
+      <div class="empty" id="lognote">Pick a run on the left to plot it.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const statusEl = $("#status");
+function setStatus(text, cls){ statusEl.textContent = text; statusEl.className = "pill " + (cls||""); }
+
+let info = { control:false, screen:false, w:0, h:0 };
+
+// ── Tabs ────────────────────────────────────────────────────────────────────
+function showTab(name){
+  for (const t of ["screen","logs"]){
+    $("#tab-"+t).setAttribute("aria-selected", String(t===name));
+    $("#view-"+t).classList.toggle("on", t===name);
+  }
+  onScreenTab = (name === "screen");
+  if (name === "logs" && !logsLoaded) loadLogList();
+  if (name === "logs") requestAnimationFrame(redrawCharts);
+}
+$("#tab-screen").onclick = () => showTab("screen");
+$("#tab-logs").onclick   = () => showTab("logs");
+
+// ── Screen mirror ───────────────────────────────────────────────────────────
+// Long-poll: the server holds the request until the panel actually changes, so
+// a static screen costs no bandwidth and a touch shows up within a frame.
+const img = $("#screen"), screenmsg = $("#screenmsg"), scaleSel = $("#scale");
+let seq = 0, lastUrl = null, mirrorStop = false, onScreenTab = true;
+
+function msg(text){
+  screenmsg.textContent = text || "";
+  screenmsg.style.display = text ? "block" : "none";
+  img.style.visibility = text && !lastUrl ? "hidden" : "visible";
+}
+
+async function mirrorLoop(){
+  while (!mirrorStop){
+    // Nothing to mirror while the tab is hidden or the Logs view is up: the
+    // server only captures the panel while somebody is actually asking for it.
+    if (document.hidden || !onScreenTab){ await sleep(400); continue; }
+    try{
+      const r = await fetch(`/api/screen.png?seq=${seq}&scale=${scaleSel.value}`,
+                            {cache:"no-store"});
+      if (r.status === 204) continue;                 // no change within the wait
+      if (r.status === 401){ setStatus("signed out","err"); msg("Session ended — reload to sign in again."); return; }
+      if (r.status === 503){ msg("The panel display is not running (bibby is in headless mode). The Logs tab still works."); await sleep(3000); continue; }
+      if (!r.ok){ throw new Error("HTTP "+r.status); }
+      seq = parseInt(r.headers.get("X-Frame-Seq")||"0", 10) || seq;
+      const url = URL.createObjectURL(await r.blob());
+      img.src = url;
+      if (lastUrl) URL.revokeObjectURL(lastUrl);
+      lastUrl = url;
+      img.classList.remove("stale");
+      msg("");
+      setStatus(info.control ? "live · control enabled" : "live · view only",
+                info.control ? "ok" : "warn");
+    }catch(e){
+      img.classList.add("stale");
+      setStatus("reconnecting…","warn");
+      await sleep(1200);
+    }
+  }
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+scaleSel.onchange = () => { seq = 0; };
+
+// ── Pointer injection ───────────────────────────────────────────────────────
+// Coordinates are mapped back to panel pixels, so a click lands exactly where
+// it looks like it lands. One request in flight at a time, with moves
+// coalesced: presses and releases are never dropped or reordered.
+const queue = [];
+let sending = false;
+
+function panelPoint(ev){
+  const r = img.getBoundingClientRect();
+  if (!r.width || !r.height || !info.w) return null;
+  const x = Math.round((ev.clientX - r.left) / r.width  * info.w);
+  const y = Math.round((ev.clientY - r.top)  / r.height * info.h);
+  return { x: Math.max(0, Math.min(info.w-1, x)), y: Math.max(0, Math.min(info.h-1, y)) };
+}
+
+// A move may overwrite the previous still-unsent move; presses and releases
+// always keep their place in the queue, so a drag can never end pressed.
+function send(x, y, state, coalesce){
+  const last = queue[queue.length-1];
+  if (coalesce && last && last.coalesce){ last.x = x; last.y = y; }
+  else queue.push({x, y, state, coalesce});
+  pump();
+}
+async function pump(){
+  if (sending) return;
+  sending = true;
+  while (queue.length){
+    const p = queue.shift();
+    try{
+      await fetch("/api/input", {method:"POST", cache:"no-store",
+                                 body:`${p.x},${p.y},${p.state}`});
+    }catch(e){ /* the mirror loop already reports connection trouble */ }
+  }
+  sending = false;
+}
+
+let down = false;
+img.addEventListener("pointerdown", ev => {
+  if (!info.control) return;
+  const p = panelPoint(ev); if (!p) return;
+  down = true;
+  img.setPointerCapture(ev.pointerId);
+  send(p.x, p.y, 1, false);
+  ev.preventDefault();
+});
+img.addEventListener("pointermove", ev => {
+  if (!info.control || !down) return;
+  const p = panelPoint(ev); if (!p) return;
+  send(p.x, p.y, 1, true);
+  ev.preventDefault();
+});
+function release(ev){
+  if (!info.control || !down) return;
+  const p = panelPoint(ev);
+  down = false;
+  if (p) send(p.x, p.y, 0, false);
+}
+img.addEventListener("pointerup", release);
+img.addEventListener("pointercancel", release);
+img.addEventListener("lostpointercapture", () => { down = false; });
+img.addEventListener("contextmenu", ev => ev.preventDefault());
+img.addEventListener("dragstart", ev => ev.preventDefault());
+
+// ── Log list ────────────────────────────────────────────────────────────────
+let logsLoaded = false, selected = null;
+
+async function loadLogList(){
+  const box = $("#logitems");
+  try{
+    const logs = await (await fetch("/api/logs", {cache:"no-store"})).json();
+    logsLoaded = true;
+    if (!logs.length){ box.innerHTML = '<div class="empty">No logs yet.</div>'; return; }
+    box.innerHTML = "";
+    for (const L of logs){
+      const el = document.createElement("div");
+      el.className = "logitem";
+      el.setAttribute("aria-selected", String(L.path === selected));
+      const kb = L.bytes > 1048576 ? (L.bytes/1048576).toFixed(1)+" MB"
+                                   : Math.max(1,Math.round(L.bytes/1024))+" kB";
+      el.innerHTML = `<div class="n"></div><div class="s"><span></span><span>${kb}</span></div>`;
+      el.querySelector(".n").textContent = L.path;
+      el.querySelector(".s span").textContent = L.when;
+      if (L.active){
+        const live = document.createElement("span");
+        live.className = "live"; live.textContent = "● live";
+        el.querySelector(".s").appendChild(live);
+      }
+      el.onclick = () => selectLog(L, el);
+      box.appendChild(el);
+    }
+  }catch(e){
+    box.innerHTML = '<div class="empty">Could not load the log list.</div>';
+  }
+}
+$("#reload").onclick = loadLogList;
+
+async function selectLog(L, el){
+  selected = L.path;
+  for (const n of document.querySelectorAll(".logitem"))
+    n.setAttribute("aria-selected", String(n === el));
+  $("#logtitle").textContent = L.path;
+  $("#logmeta").textContent = "loading…";
+  $("#download").hidden = false;
+  $("#download").href = "/api/log/download?path=" + encodeURIComponent(L.path);
+  $("#download").setAttribute("download", L.path.replace(/\//g,"-"));
+  try{
+    const d = await (await fetch("/api/log?path=" + encodeURIComponent(L.path) +
+                                 "&points=1400", {cache:"no-store"})).json();
+    plot(d);
+  }catch(e){
+    $("#logmeta").textContent = "could not read this log";
+  }
+}
+
+// ── Charts ──────────────────────────────────────────────────────────────────
+const TEMP_SERIES = [
+  {key:"temp_filt_c",  name:"filtered",  color:"#50c8ff", width:2.4, axis:"l"},
+  {key:"temp_raw_c",   name:"raw",       color:"#9aa4b0", width:1,   axis:"l"},
+  {key:"setpoint_c",   name:"setpoint",  color:"#37c871", width:1.6, axis:"l", dash:[6,4]},
+];
+const POW_SERIES = [
+  {key:"p_demand_w",    name:"demand",    color:"#ff8c2e", width:1.8, axis:"l"},
+  {key:"p_delivered_w", name:"delivered", color:"#c4823f", width:1.4, axis:"l"},
+  {key:"pid_ff_w",      name:"ff",        color:"#2fd4c4", width:1.2, axis:"l"},
+  {key:"pid_p_w",       name:"P",         color:"#4aa8ff", width:1.2, axis:"l"},
+  {key:"pid_i_w",       name:"I",         color:"#b07aff", width:1.2, axis:"l"},
+  {key:"pid_d_w",       name:"D",         color:"#9aa4b0", width:1.2, axis:"l"},
+  {key:"duty1",         name:"E1 duty",   color:"#ffb020", width:1.2, axis:"r"},
+  {key:"duty2",         name:"E2 duty",   color:"#ff4b3e", width:1.2, axis:"r"},
+];
+const charts = {};
+
+function plot(d){
+  const t = d.series.t_monotonic_s || [];
+  $("#logmeta").textContent =
+    `${d.rows.toLocaleString()} rows · ${fmtDur(d.duration_s)} · started ${d.wall_start||"?"}` +
+    (d.points < d.rows ? ` · averaged to ${d.points} points` : "");
+  $("#lognote").hidden = true;
+  $("#card-temp").hidden = $("#card-pow").hidden = false;
+  charts.temp = makeChart($("#chart-temp"), $("#leg-temp"), t, TEMP_SERIES, d.series, "°C", "");
+  charts.pow  = makeChart($("#chart-pow"),  $("#leg-pow"),  t, POW_SERIES,  d.series, "W", "duty");
+  redrawCharts();
+}
+function fmtDur(s){
+  s = Math.round(s||0);
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+  return h ? `${h} h ${m} min` : `${m} min ${s%60} s`;
+}
+function fmtTime(s){
+  s = Math.max(0, s);
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60), sec = Math.floor(s%60);
+  return h ? `${h}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`
+           : `${m}:${String(sec).padStart(2,"0")}`;
+}
+
+function makeChart(canvas, legendEl, t, defs, series, leftUnit, rightUnit){
+  const c = { canvas, t, leftUnit, rightUnit, hover:-1, cssH: canvas.height || 260,
+              series: defs.filter(s => Array.isArray(series[s.key]))
+                          .map(s => ({...s, data:series[s.key], on:true})) };
+  legendEl.innerHTML = "";
+  for (const s of c.series){
+    const chip = document.createElement("button");
+    chip.className = "chip";
+    chip.type = "button";
+    chip.setAttribute("aria-pressed","true");
+    chip.innerHTML = `<span class="sw" style="background:${s.color}"></span>`;
+    chip.appendChild(document.createTextNode(s.name + (s.axis==="r" ? " ↗" : "")));
+    chip.onclick = () => { s.on = !s.on; chip.setAttribute("aria-pressed", String(s.on)); draw(c); };
+    legendEl.appendChild(chip);
+  }
+  canvas.onpointermove = ev => {
+    const r = canvas.getBoundingClientRect();
+    c.hover = ev.clientX - r.left;
+    draw(c);
+  };
+  canvas.onpointerleave = () => { c.hover = -1; draw(c); };
+  return c;
+}
+function redrawCharts(){ for (const k in charts) if (charts[k]) draw(charts[k]); }
+addEventListener("resize", redrawCharts);
+
+function niceStep(range, target){
+  const raw = range / Math.max(1, target);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw||1)));
+  const n = raw / mag;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+}
+
+function draw(c){
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = c.canvas.clientWidth || 600, cssH = c.cssH;
+  c.canvas.width = Math.round(cssW * dpr);
+  c.canvas.height = Math.round(cssH * dpr);
+  c.canvas.style.height = cssH + "px";
+  const g = c.canvas.getContext("2d");
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,cssW,cssH);
+
+  const t = c.t;
+  if (!t.length){ return; }
+  const hasRight = c.series.some(s => s.on && s.axis === "r");
+  const L = 52, R = hasRight ? 46 : 14, T = 10, B = 26;
+  const w = cssW - L - R, h = cssH - T - B;
+  if (w <= 10 || h <= 10) return;
+
+  const range = axis => {
+    let lo = Infinity, hi = -Infinity;
+    for (const s of c.series) if (s.on && s.axis === axis)
+      for (const v of s.data){ if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (!isFinite(lo)) return null;
+    if (hi - lo < 1e-9){ hi = lo + 1; lo -= 1; }
+    const pad = (hi - lo) * 0.06;
+    return [lo - pad, hi + pad];
+  };
+  const yl = range("l"), yr = range("r");
+  const t0 = t[0], t1 = t[t.length-1] || t0 + 1;
+  const X = i => L + (t[i] - t0) / Math.max(1e-9, t1 - t0) * w;
+  const Yl = v => T + h - (v - yl[0]) / (yl[1] - yl[0]) * h;
+  const Yr = v => T + h - (v - yr[0]) / (yr[1] - yr[0]) * h;
+
+  // Plot frame and gridlines.
+  g.fillStyle = "#141a20"; g.fillRect(L,T,w,h);
+  g.strokeStyle = "#262e38"; g.lineWidth = 1;
+  g.font = "11px ui-monospace,SFMono-Regular,Menlo,monospace";
+  g.fillStyle = "#9aa4b0";
+
+  if (yl){
+    const step = niceStep(yl[1]-yl[0], 5);
+    g.textAlign = "right"; g.textBaseline = "middle";
+    for (let v = Math.ceil(yl[0]/step)*step; v <= yl[1]; v += step){
+      const y = Math.round(Yl(v)) + .5;
+      g.beginPath(); g.moveTo(L,y); g.lineTo(L+w,y); g.stroke();
+      g.fillText(fmtNum(v), L-7, y);
+    }
+    g.textAlign = "left"; g.textBaseline = "top";
+    g.fillText(c.leftUnit, 4, T);
+  }
+  if (yr && hasRight){
+    const step = niceStep(yr[1]-yr[0], 5);
+    g.textAlign = "left"; g.textBaseline = "middle";
+    g.fillStyle = "#6f7a86";
+    for (let v = Math.ceil(yr[0]/step)*step; v <= yr[1]; v += step)
+      g.fillText(fmtNum(v), L+w+7, Math.round(Yr(v))+.5);
+    g.textAlign = "right"; g.textBaseline = "top";
+    g.fillText(c.rightUnit, cssW-4, T);
+    g.fillStyle = "#9aa4b0";
+  }
+
+  const tstep = niceStep(t1-t0, 6);
+  g.textAlign = "center"; g.textBaseline = "top";
+  for (let v = Math.ceil(t0/tstep)*tstep; v <= t1; v += tstep){
+    const x = Math.round(L + (v-t0)/Math.max(1e-9,t1-t0)*w) + .5;
+    g.strokeStyle = "#222a33";
+    g.beginPath(); g.moveTo(x,T); g.lineTo(x,T+h); g.stroke();
+    g.fillText(fmtTime(v), x, T+h+6);
+  }
+  g.strokeStyle = "#39434f";
+  g.strokeRect(L+.5, T+.5, w, h);
+
+  // Traces.
+  g.save();
+  g.beginPath(); g.rect(L,T,w,h); g.clip();
+  g.lineJoin = g.lineCap = "round";
+  for (const s of c.series){
+    if (!s.on) continue;
+    const Y = s.axis === "r" ? Yr : Yl;
+    if (s.axis === "r" && !yr) continue;
+    g.strokeStyle = s.color;
+    g.lineWidth = s.width;
+    g.setLineDash(s.dash || []);
+    g.beginPath();
+    for (let i = 0; i < t.length; i++){
+      const y = Y(s.data[i]);
+      if (i === 0) g.moveTo(X(i), y); else g.lineTo(X(i), y);
+    }
+    g.stroke();
+    g.setLineDash([]);
+  }
+  g.restore();
+
+  // Hover crosshair and readout.
+  if (c.hover >= L && c.hover <= L+w){
+    const frac = (c.hover - L) / w;
+    let i = Math.round(frac * (t.length-1));
+    i = Math.max(0, Math.min(t.length-1, i));
+    const x = X(i);
+    g.strokeStyle = "#5a6472"; g.setLineDash([3,3]);
+    g.beginPath(); g.moveTo(x+.5,T); g.lineTo(x+.5,T+h); g.stroke();
+    g.setLineDash([]);
+
+    const rows = [["t", fmtTime(t[i])]];
+    for (const s of c.series) if (s.on)
+      rows.push([s.name, fmtNum(s.data[i]) + (s.axis==="r" ? "" : " "+c.leftUnit)]);
+    const bw = 128, bh = rows.length*14 + 10;
+    let bx = x + 10; if (bx + bw > L+w) bx = x - bw - 10;
+    let by = T + 8;  if (by + bh > T+h) by = T+h-bh-4;
+    g.fillStyle = "rgba(15,18,22,.93)";
+    g.strokeStyle = "#39434f";
+    g.beginPath();
+    if (g.roundRect) g.roundRect(bx, by, bw, bh, 6); else g.rect(bx, by, bw, bh);
+    g.fill(); g.stroke();
+    g.textBaseline = "middle";
+    rows.forEach((r,k) => {
+      const y = by + 12 + k*14;
+      g.fillStyle = k ? (c.series.filter(s=>s.on)[k-1].color) : "#9aa4b0";
+      g.textAlign = "left";  g.fillText(r[0], bx+8, y);
+      g.fillStyle = "#e8ecf1";
+      g.textAlign = "right"; g.fillText(r[1], bx+bw-8, y);
+    });
+  }
+}
+function fmtNum(v){
+  if (!isFinite(v)) return "–";
+  const a = Math.abs(v);
+  return a >= 1000 ? v.toFixed(0) : a >= 100 ? v.toFixed(1)
+       : a >= 1 ? v.toFixed(2) : v.toFixed(3);
+}
+
+// ── Boot ────────────────────────────────────────────────────────────────────
+(async function(){
+  try{
+    info = await (await fetch("/api/info", {cache:"no-store"})).json();
+  }catch(e){ setStatus("offline","err"); msg("Cannot reach bibby."); return; }
+  $("#screeninfo").textContent =
+    `panel ${info.w}×${info.h}` + (info.control ? " · tap or drag to control"
+                                                : " · remote control disabled in bibby.ini");
+  img.classList.toggle("readonly", !info.control);
+  if (!info.screen){
+    msg("The panel display is not running (bibby is in headless mode). The Logs tab still works.");
+    setStatus("no display","warn");
+  }
+  mirrorLoop();
+})();
+</script>
+</body>
+</html>

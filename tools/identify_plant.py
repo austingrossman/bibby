@@ -9,7 +9,8 @@ physical parameters to the measured temperature by least squares:
     m·c · dT/dt = P(t) − k_loss · (T − T_amb)          (kettle)
     T_meas(t)   = T(t − L)                             (probe + filter delay)
 
-    m·c     [J/°C]   thermal mass of the batch (≈ 4186 J/°C per litre)
+    m·c     [J/°C]   thermal mass of the batch, reported as m in litres of
+                     water (m = m·c / 4186), the way bibby logs and shows it
     k_loss  [W/°C]   heat-loss coefficient to the room
     L       [s]      effective dead time (probe lag + filter group delay)
 
@@ -46,7 +47,7 @@ Usage:
 
 Options:
     --ambient C     Room / ambient temperature during the test, °C. Required.
-    --volume-l L    Water volume you put in.  Compares the fitted m·c against
+    --volume-l L    Water volume you put in.  Compares the fitted m against
                     the water alone to show whether the delivered watts are
                     really what bibby.ini says (mains voltage, element
                     tolerance) — the usual reason the two disagree.
@@ -56,7 +57,10 @@ Options:
                     ZN/CC reaction-curve rules are meaningless on a lag-
                     dominant plant (L ≪ τ) and print absurd gains there.
     --lambda  SEC   SIMC closed-loop time constant τc, seconds.  Default:
-                    max(3·L, 120 s) — smooth rather than tight.
+                    max(3·L, 120 s) — smooth rather than tight.  The shipped
+                    bibby.ini uses 30 s; README §9.5 explains the trade-off
+                    (kp = m·c/(τc+L), P saturates above ramp_rate×(τc+L) of
+                    error, Ti = 4(τc+L)).
     -o FILE         Save plot to FILE instead of displaying interactively.
 
 Workflow
@@ -409,8 +413,8 @@ def main():
 
   print()
   print("── Lumped kettle model  m·c·dT/dt = P − k_loss·(T − T_amb) ──")
-  print(f"  m·c     = {pm(mc / 1000, se[0] / 1000, '.2f')}  kJ/°C"
-        f"   (≈ {mc / 4186:.1f} L of water)")
+  print(f"  m       = {pm(mc / 4186, se[0] / 4186, '.1f')}  L of water"
+        f"   (m·c = {mc / 1000:.1f} kJ/°C; this is what bibby logs as m_est_l)")
   print(f"  k_loss  = {pm(k_loss, se[1], '.2f')}  W/°C   (heat loss per °C above ambient)")
   print(f"  L       = {pm(L, se[2], '.1f')}  s     (probe lag + filter delay)")
   print(f"  T(0)    = {T_amb + th0:.2f} °C   ({th0:+.2f} °C vs ambient at log start)")
@@ -446,7 +450,7 @@ def main():
     warn.append(f"k_loss standard error is {rel[1] * 100:.0f} % of its value — poorly\n"
                 "  determined.  Extend the cooling phase.")
   if np.isfinite(rel[0]) and rel[0] > 0.1:
-    warn.append(f"m·c standard error is {rel[0] * 100:.0f} % of its value.  Check that the\n"
+    warn.append(f"m standard error is {rel[0] * 100:.0f} % of its value.  Check that the\n"
                 "  heating phase has a clear ramp and the pump was running.")
   if float(Tg.max()) > 90.0:
     warn.append("Temperature exceeded 90 °C: evaporative loss makes k_loss\n"
@@ -492,15 +496,14 @@ def main():
     ratio = mc / mc_water
     print()
     print("── Delivered-watts cross-check ────────────────────────────────")
-    print(f"  m·c fit / m·c of {args.volume_l:.1f} L water = {mc / 1000:.1f} / "
-          f"{mc_water / 1000:.1f} kJ/°C = {ratio:.3f}")
-    print(f"  The kettle, elements, pump and hoses add a few kJ/°C on top of the water,")
+    print(f"  m fit / water put in = {mc / 4186:.1f} L / {args.volume_l:.1f} L = {ratio:.3f}")
+    print(f"  The kettle, elements, pump and hoses add a litre or two of equivalent water,")
     print(f"  so a ratio a little above 1 is expected.  Anything beyond that means the")
     print(f"  elements delivered about {100.0 / ratio:.0f} % of what bibby.ini calls their")
     print(f"  rated watts (mains below the rating voltage, element resistance tolerance,")
     print(f"  SSR drop).  The gains and feedforward above are still right: the controller,")
     print(f"  the log and this fit all use the same nominal watts, so the factor cancels")
-    print(f"  in the loop.  Only the displayed/logged watts, the m·c readout and the flux")
+    print(f"  in the loop.  Only the displayed/logged watts, the m readout and the flux")
     print(f"  cap are mislabeled.  If you correct element1_watts / element2_watts by a")
     print(f"  factor s (measure V and R: P = V²/R, or s = {1.0 / ratio:.2f} if the volume is")
     print(f"  trusted), scale kp and ki by s and process_gain_c by 1/s — or rerun the")
@@ -510,6 +513,7 @@ def main():
   print("── FOPDT equivalents ──────────────────────────────────────────")
   print(f"  K   = 1/k_loss   = {K * 1000:.3f}  °C per kW")
   print(f"  τ   = m·c/k_loss = {tau:.0f}  s  ({tau / 60:.1f} min)")
+  print(f"  kp  = m·c/(τc+L) for SIMC; P saturates above ramp_rate × (τc+L) of error")
   print(f"  L                = {L:.1f}  s  (used for tuning)")
   print(f"  L/τ              = {L / tau:.4f}"
         f"  ({'easy' if L/tau < 0.3 else 'moderate' if L/tau < 1.0 else 'difficult'}"
@@ -555,6 +559,12 @@ def main():
     print()
   print("  Anti-windup needs no extra setup: conditional integration plus the")
   print("  out_max/ki backstop in control.c bound the integrator automatically.")
+  print("  Keep pid.i_band_c (integral separation, README §2.4) at ~0.5 °C so the")
+  print("  integrator stays out of the approach and cannot build overshoot.")
+  print()
+  print("── bibby.ini adaptive reference  (README §9.5) ──")
+  print(f"  [adaptive]")
+  print(f"  m_ref_l = {mc / 4186:.1f}   # the batch these gains were tuned at, as the estimator reads it")
   print()
 
   # ── Feedforward block ─────────────────────────────────────────────────────
@@ -578,7 +588,7 @@ def main():
       ax1.axvspan(tg[ph['i0']], tg[ph['i1']], color='orange', alpha=0.08, lw=0)
   ax1.plot(tg, Tg, color='steelblue', lw=1.5, label='temp_filt_c (measured)')
   ax1.plot(tg, Tm, '--', color='tomato', lw=1.5,
-           label=(f'model  m·c={mc / 1000:.1f} kJ/°C, k_loss={k_loss:.1f} W/°C, '
+           label=(f'model  m={mc / 4186:.1f} L, k_loss={k_loss:.1f} W/°C, '
                   f'L={L:.0f} s  (RMSE {rmse:.3f} °C)'))
   ax1.plot(tg, Tk, ':', color='gray', lw=0.8, label='kettle (undelayed)')
   ax1.axhline(T_amb, color='gray', ls='-.', lw=0.8, label=f'ambient {T_amb:.1f} °C')

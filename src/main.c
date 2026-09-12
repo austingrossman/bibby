@@ -16,6 +16,7 @@
 #include "ssr_thread.h"
 #include "state.h"
 #include "ui/ui.h"
+#include "web/web.h"
 
 // Pin map (fixed by the HAT; see README).
 #define GPIO_CHIP  "/dev/gpiochip4"   // Pi 5
@@ -205,6 +206,12 @@ int main(int argc, char **argv) {
   if (mlockall(MCL_CURRENT) != 0)
     perror("bibby: mlockall (continuing)");
 
+  // Optional LAN web interface. It is off unless [web] is configured with a
+  // password, and it never touches the SSRs directly: remote taps are injected
+  // into the UI as pointer events, so control still flows through the panel's
+  // own widgets and interlocks. A failure to start is non-fatal.
+  web_start(&g_state, &cfg, logger.path);
+
   if (headless) {
     headless_loop(&g_state);
   } else if (ui_run_mode(&g_state, &cfg, ui_test) != 0) {
@@ -213,6 +220,7 @@ int main(int argc, char **argv) {
   }
 
   atomic_store(&g_state.running, false);
+  web_stop();
   pthread_join(sampler_tid, NULL);
   pthread_join(ssr_tid, NULL);   // drives SSRs low on its way out
 

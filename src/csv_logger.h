@@ -17,7 +17,7 @@ typedef struct {
   float    duty1, duty2;
   float    flux1_w_cm2, flux2_w_cm2;
   PidTerms pid;
-  float    mc_est_j_per_c;  // online thermal-mass estimate (0 = none)
+  float    m_est_l;         // online batch-size estimate, litres (0 = none)
   bool     manual;
   bool     grain_in;
   uint8_t  rtd_fault;
