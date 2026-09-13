@@ -3,11 +3,11 @@
 #include <math.h>
 #include <string.h>
 
-// Window and pacing constants. 120 s of data at one stored point per 0.5 s;
+// Window and pacing constants. MASS_WINDOW_S seconds of data at one stored point per 0.5 s;
 // a fresh evaluation at most every 10 s. A window is only trusted when the
 // power is steady (low relative spread) and the temperature moved enough to
 // dominate sensor noise (>= 1 degC).
-#define MASS_WINDOW_S     120.0
+#define MASS_WINDOW_S     40.0
 #define MASS_STORE_DT_S   0.5
 #define MASS_EVAL_DT_S    10.0
 #define MASS_MIN_RISE_C   1.0f
