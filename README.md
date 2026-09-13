@@ -120,7 +120,7 @@ no locks on the hot paths. Key fields:
 | Field | Writer | Purpose |
 |---|---|---|
 | `duty1`, `duty2` | sampler | per-element duty commands in `[0,1]` |
-| `p_demand_w`, `p_delivered_w` | sampler | commanded and measured average power |
+| `p_demand_w` | sampler | commanded power — also the delivered average power (§2.3) |
 | `temp_raw_c`, `temp_filt_c`, `temp_valid` | sampler | latest sensor sample and validity |
 | `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in`, `simulate_zc` | UI | user intent |
 | `output1`, `output2`, `zc_count`, `watchdog_alarm` | SSR thread | fired state, ZC counter, ZC watchdog |
@@ -148,8 +148,8 @@ Paced by the MAX31865 DRDY edge (one conversion per mains cycle, so ~60 Hz):
 4. **Control law** (§2.4): manual watts pass straight through; in auto, the
    watts-based PID runs once per fresh sample.
 5. **Power split** (§2.4) turns the demand into `duty1`/`duty2`.
-6. **Slow tick (0.5 s):** compute delivered power from the SSR thread's fired
-   counters, update the batch-size estimator (§2.7), push a chart history point.
+6. **Slow tick (0.5 s):** publish the batch-size estimate (§2.7) and push a
+   chart history point.
 7. **CSV logging** (§10): one row per fresh sample (or per 0.5 s during an
    outage, so faults stay on disk).
 
@@ -175,8 +175,6 @@ Runs at `SCHED_FIFO` (real-time) priority, pinned to the AC zero crossing:
    (`2 × mains_Hz`), duties are forced to zero — a wedged control loop must not
    leave the heaters running. (`BIBBY_TEST_WEDGE=<sec>` wedges the sampler once,
    5 s in, to demonstrate exactly this on the bench.)
-5. **Fired counters.** Per-element counts of fired half-cycles let the sampler
-   compute true delivered watts over each slow tick.
 
 ### 2.4 Control law — `src/control.c`, `src/power_split.c`
 
@@ -259,14 +257,14 @@ at the true temperature instead of ramping from zero.
 
 ### 2.7 Batch-size estimator — `src/mass_estimator.c`
 
-During any stretch of roughly constant delivered power where the temperature
-rises ≥ 1 °C, the kettle behaves as an integrator: `dT/dt = P/(m·c)`. A
+During any stretch of roughly constant commanded power (taken as 0 W while the
+ZC watchdog holds the SSRs off) where the temperature rises ≥ 1 °C, the kettle behaves as an integrator: `dT/dt = P/(m·c)`. A
 least-squares slope over the stretch gives the thermal mass `P/slope` in J/°C,
 which is reported as the equivalent litres of water, `m = (P/slope)/4186`, so
 the number on the status line (`m 53.2 L`) and in the log (`m_est_l`) is a
 batch size a brewer can sanity-check against what they poured in. It reads a
 little high because the kettle, elements and hoses count as water, and it
-reads `1/s` high when the elements deliver a fraction `s` of their rated watts
+reads `1/s` high when the elements put out a fraction `s` of their rated watts
 (the shipped setup reads 53 L for 45 L poured; §9.4). It is always computed
 and logged; feeding it back into the gains is the separate, config-gated
 adaptive scaling of §2.4.
@@ -691,7 +689,7 @@ than exiting — the controller and safety logic keep running.
   set swap + logged event marker), Manual Control (manual watts vs PID auto).
 - **Charts:** temperature (setpoint / temp / raw + grain-event and mode-event
   markers — short dashes along the top edge at the samples where Grain In or
-  Manual flipped) and power (demand W / delivered / ff / P / I / D), window set
+  Manual flipped) and power (demand W / ff / P / I / D), window set
   by `ui.chart_window_min`, y-autoscaled.
 - **Chart legends:** each trace has a chip under its chart — tap to drop that
   trace. A hidden trace is neither drawn nor counted in that chart's autoscale,
@@ -736,7 +734,7 @@ or the browser tab is hidden.
 
 **Logs tab** — every run under `~/bibby/logs` newest first (the run in progress
 is marked "● live"). Pick one to plot it: temperature (filtered / raw /
-setpoint) and power (demand, delivered, ff/P/I/D, and per-element duty on a
+setpoint) and power (demand, ff/P/I/D, and per-element duty on a
 right-hand axis). Legend chips toggle traces, and hovering reads out every
 visible series at that instant. **Download CSV** fetches the raw file — the
 same one `tools/identify_plant.py` and `tools/plot_logs.py` expect — so a brew
@@ -1020,8 +1018,9 @@ kd_ini = Kd_c / T_s
 `m` (the batch size, litres), `k_loss`, and `L` come from a **heat-then-cool test**: run the elements
 at a fixed high power in manual mode until the kettle reaches mash
 temperature, then turn them off and let it cool. `tools/identify_plant.py`
-drives the lumped model of §9.3 with the power the log says was actually
-delivered, fits the three parameters to the measured temperature by least
+drives the lumped model of §9.3 with the logged power demand `p_demand_w`
+(which the modulator delivers, §2.3; rows where the ZC watchdog was up count
+as 0 W), fits the three parameters to the measured temperature by least
 squares, and prints ready-to-paste `[pid]`/`[feedforward]` blocks.
 
 Each phase pins down something the other cannot:
@@ -1061,7 +1060,7 @@ follow directly.
 6. **Stop** bibby and copy the log from `~/bibby/logs/YYYY/MM/DD/HH-MM-SS.csv`.
 
 The power trace does not have to be clean — the script uses whatever
-`p_delivered_w` says was delivered, sample by sample — but the plant must not
+`p_demand_w` was, sample by sample — but the plant must not
 change mid-test (no adding water, no lid on/off).
 
 #### Running the identification
@@ -1079,7 +1078,7 @@ python3 tools/identify_plant.py logs/... --ambient 21.5 --lambda 30
 
 The whole log is used; there is no window to choose. `--ambient` is the room
 temperature you measured, in °C; `--volume-l` is the water you put in, used
-only for the delivered-watts cross-check below. The script prints:
+only for the element-watts cross-check below. The script prints:
 
 - the power phases it found (heat/cool spans, mean watts, temperature range);
 - the fitted `m` in litres (compare against what you poured in), `k_loss`, and `L`,
@@ -1091,7 +1090,7 @@ only for the delivered-watts cross-check below. The script prints:
 - two corner diagnostics the lumped model does not contain (below): the dead
   time read directly off the power-on corner, and the mixing offset;
 - with `--volume-l`, the ratio of the fitted `m` to the litres you put in.
-  A ratio well above 1 means the elements delivered fewer watts than
+  A ratio well above 1 means the elements put out fewer watts than
   `element1_watts`/`element2_watts` claim — mains below the rating voltage,
   element resistance tolerance, SSR drop. The gains and feedforward are still
   correct: the controller, the log, and the fit all work in the same nominal
@@ -1114,7 +1113,7 @@ straight off the power-on corner — the time for the measured slope to reach
 half its steady ramp value — and uses the larger of the two for tuning.
 
 The plot shows the measured temperature against the model (heating phases
-shaded), the delivered power, and the residuals. Spikes in the residual at the
+shaded), the commanded power, and the residuals. Spikes in the residual at the
 power corners are the mixing offset and probe lag above. A residual that
 drifts through the cooling phase means `k_loss` or the ambient value is wrong.
 
@@ -1266,14 +1265,16 @@ unattended runs. Columns:
 
 ```
 wall_time, t_monotonic_s, temp_raw_c, temp_filt_c, setpoint_c,
-p_demand_w, p_delivered_w, duty1, duty2, flux1_w_cm2, flux2_w_cm2,
+p_demand_w, duty1, duty2, flux1_w_cm2, flux2_w_cm2,
 pid_ff_w, pid_p_w, pid_i_w, pid_d_w, pid_integral, pid_deriv, pid_error_c,
 m_est_l, manual, grain_in, rtd_fault, watchdog
 ```
 
-- `p_demand_w` is the commanded power; `p_delivered_w` is measured from the
-  SSR fired counters over each 0.5 s tick — they differ while the watchdog
-  holds the outputs off, which is itself useful data.
+- `p_demand_w` is the commanded power after every clamp (grain cap, flux cap).
+  The sigma-delta modulator delivers it on average (§2.3), so it is also the
+  delivered power — except while `watchdog` is 1, when the SSRs are held off.
+  Logs written before 2026-09-13 carry an extra `p_delivered_w` column after
+  it; the tools look columns up by name, so both kinds open.
 - `flux1/2_w_cm2` are the per-element surface power densities from the split.
 - `pid_*_w` is the feedforward / P / I / D breakdown in watts (§9.5);
   `pid_error_c` the residual error.

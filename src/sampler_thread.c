@@ -14,34 +14,11 @@
 #define DRDY_TIMEOUT_NS   500000000LL   // 500 ms
 // No fresh conversion for this long (with a sensor present) = sensor fault.
 #define UNRESPONSIVE_S    1.0
-// Cadence for the delivered-power measurement and the chart history push.
+// Cadence for the chart history push and the batch-size readout.
 #define SLOW_TICK_S       0.5
 
 static float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
-}
-
-// Measured output power over the last slow tick, from the SSR thread's fired
-// half-cycle counters: delivered = (fired fraction) x (rated watts), summed.
-typedef struct {
-  uint32_t zc, fired1, fired2;
-} FiredSnapshot;
-
-static float delivered_power_w(BibbyState *st, const BibbyConfig *cfg,
-                               FiredSnapshot *prev) {
-  FiredSnapshot cur = {
-    atomic_load(&st->zc_count),
-    atomic_load(&st->fired1),
-    atomic_load(&st->fired2),
-  };
-  uint32_t dzc = cur.zc - prev->zc;
-  float p = 0.0f;
-  if (dzc > 0) {
-    p = ((float)(cur.fired1 - prev->fired1) * cfg->element1_watts +
-         (float)(cur.fired2 - prev->fired2) * cfg->element2_watts) / (float)dzc;
-  }
-  *prev = cur;
-  return p;
 }
 
 void *sampler_thread_main(void *arg) {
@@ -79,7 +56,6 @@ void *sampler_thread_main(void *arg) {
     return NULL;
   }
 
-  FiredSnapshot fired_prev = {0};
   double last_fresh_t  = bibby_now_s();
   // Start the slow-tick clock now: firing it on the first pass would push a
   // history point before the first fresh sample (temp reads as 0 °C there,
@@ -87,7 +63,6 @@ void *sampler_thread_main(void *arg) {
   double last_slow_t   = bibby_now_s();
   double last_log_t    = 0.0;
   float  temp_filt     = 0.0f;
-  float  p_delivered   = 0.0f;
   bool   prev_manual   = true;
   bool   prev_grain    = false;
 
@@ -203,11 +178,9 @@ void *sampler_thread_main(void *arg) {
       atomic_store(&st->duty2, split.duty2);
     }
 
-    // ── Slow tick: delivered power, batch-size estimate, chart history ───
+    // ── Slow tick: batch-size estimate, chart history ────────────────────
     if (now - last_slow_t >= SLOW_TICK_S) {
       last_slow_t = now;
-      p_delivered = delivered_power_w(st, cfg, &fired_prev);
-      atomic_store(&st->p_delivered_w, p_delivered);
       atomic_store(&st->m_est_l, m_est);
 
       HistPoint pt = {
@@ -219,7 +192,6 @@ void *sampler_thread_main(void *arg) {
         .ff_w = pid.terms.ff_w, .p_w = pid.terms.p_w,
         .i_w = pid.terms.i_w,   .d_w = pid.terms.d_w,
         .duty1 = split.duty1, .duty2 = split.duty2,
-        .p_delivered_w = p_delivered,
         .manual   = manual,
         .grain_in = grain,
         .fault    = fault,
@@ -232,7 +204,11 @@ void *sampler_thread_main(void *arg) {
     // one row per slow tick so the outage and its fault bits stay on disk.
     bool log_now = fresh || (now - last_fresh_t > SLOW_TICK_S &&
                              now - last_log_t >= SLOW_TICK_S);
-    if (fresh) mass_estimator_push(&mass, now, temp_filt, p_delivered);
+    // The modulator delivers the demand on average, so the demand is the
+    // estimator's power — except while the ZC watchdog holds the SSRs off.
+    if (fresh)
+      mass_estimator_push(&mass, now, temp_filt,
+                          atomic_load(&st->watchdog_alarm) ? 0.0f : p_demand);
     if (log_now) {
       last_log_t = now;
 
@@ -242,7 +218,6 @@ void *sampler_thread_main(void *arg) {
         .temp_filt_c   = temp_filt,
         .setpoint_c    = atomic_load(&st->setpoint_c),
         .p_demand_w    = p_demand,
-        .p_delivered_w = p_delivered,
         .duty1 = split.duty1, .duty2 = split.duty2,
         .flux1_w_cm2 = split.flux1_w_cm2, .flux2_w_cm2 = split.flux2_w_cm2,
         .pid = pid.terms,

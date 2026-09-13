@@ -1,6 +1,6 @@
 #pragma once
 
-// Online batch-size estimator. During any stretch where the delivered power
+// Online batch-size estimator. During any stretch where the commanded power
 // is roughly constant and the (filtered) temperature rises by at least 1 degC,
 // the kettle behaves as an integrator: dT/dt = P / (m*c). A least-squares
 // slope over that stretch gives the thermal mass P / slope in J/degC, which is
@@ -12,7 +12,7 @@
 // The estimate ignores heat loss, which makes it read slightly high when the
 // kettle is far above ambient, and it counts the kettle, elements and hoses
 // as water. It also scales with the ratio of real to rated element watts: if
-// the elements deliver 85 % of their rated power the estimate reads 1/0.85
+// the elements put out 85 % of their rated power the estimate reads 1/0.85
 // high. Compare it against the water actually put in to spot that.
 
 // Specific heat of water, J per kg per degC; one litre of water is one kg.
@@ -37,8 +37,9 @@ typedef struct {
 
 void mass_estimator_init(MassEstimator *e, float min_power_w);
 
-// Feed every control sample; decimation and evaluation pacing are internal.
-void mass_estimator_push(MassEstimator *e, double t_s, float temp_filt_c, float p_delivered_w);
+// Feed every control sample with the power applied to the kettle (the demand,
+// or 0 while the SSRs are held off); decimation and evaluation pacing are internal.
+void mass_estimator_push(MassEstimator *e, double t_s, float temp_filt_c, float p_w);
 
 // Smoothed batch size in litres of water, or 0 while no valid window has been seen.
 static inline float mass_estimator_value(const MassEstimator *e) { return e->estimate_l; }

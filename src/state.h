@@ -16,10 +16,9 @@ typedef struct {
   float setpoint_c;
   float temp_filt_c;
   float temp_raw_c;
-  float p_demand_w;     // control-law output (before split)
+  float p_demand_w;     // control-law output (before split) = delivered power
   float ff_w, p_w, i_w, d_w; // PID term breakdown, watts
   float duty1, duty2;
-  float p_delivered_w;  // measured from fired half-cycles
   bool  manual;
   bool  grain_in;
   bool  fault;          // any RTD fault (register bits or unresponsive)
@@ -42,7 +41,6 @@ typedef struct {
   atomic_bool     output1, output2;   // SSR fired state this half-cycle
   atomic_bool     watchdog_alarm;     // no ZC edge within the mains-derived timeout
   atomic_uint     zc_count;           // zero crossings seen (real or simulated)
-  atomic_uint     fired1, fired2;     // cumulative fired half-cycles per element
 
   // Sampler -> UI.
   _Atomic float   temp_raw_c;
@@ -50,8 +48,7 @@ typedef struct {
   atomic_bool     temp_valid;         // at least one good conversion since start
   atomic_uchar    rtd_fault;          // MAX31865 fault register bits (0 = none)
   atomic_bool     rtd_unresponsive;   // DRDY silent — sensor missing/hung
-  _Atomic float   p_demand_w;
-  _Atomic float   p_delivered_w;      // rolling measured output power
+  _Atomic float   p_demand_w;         // commanded power; the modulator delivers it on average
   _Atomic float   m_est_l;            // online batch-size estimate, litres of water (0 = none yet)
   _Atomic float   adaptive_scale;     // gain scale in effect (1.0 when disabled)
   atomic_bool     fault_forced_manual;// auto was blocked/kicked by a sensor fault

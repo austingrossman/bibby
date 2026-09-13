@@ -110,8 +110,6 @@ void *ssr_thread_main(void *arg) {
         fire2 ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE);
     atomic_store(&st->output1, fire1);
     atomic_store(&st->output2, fire2);
-    if (fire1) atomic_fetch_add(&st->fired1, 1);
-    if (fire2) atomic_fetch_add(&st->fired2, 1);
   }
 
   ssrs_off(a);

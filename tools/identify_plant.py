@@ -3,8 +3,10 @@
 identify_plant.py — BIAB kettle plant identification and PID tuning
 --------------------------------------------------------------------
 Loads a bibby CSV log of a heat-then-cool test, drives the lumped kettle
-model with the power that was actually delivered, and fits the model's
-physical parameters to the measured temperature by least squares:
+model with the logged power demand p_demand_w (the sigma-delta modulator
+delivers the demand on average; it is taken as 0 W wherever the ZC watchdog
+held the SSRs off), and fits the model's physical parameters to the measured
+temperature by least squares:
 
     m·c · dT/dt = P(t) − k_loss · (T − T_amb)          (kettle)
     T_meas(t)   = T(t − L)                             (probe + filter delay)
@@ -48,8 +50,8 @@ Usage:
 Options:
     --ambient C     Room / ambient temperature during the test, °C. Required.
     --volume-l L    Water volume you put in.  Compares the fitted m against
-                    the water alone to show whether the delivered watts are
-                    really what bibby.ini says (mains voltage, element
+                    the water alone to show whether the elements really put
+                    out the watts bibby.ini says (mains voltage, element
                     tolerance) — the usual reason the two disagree.
     --dt      SEC   Resample period for the fit (default 1.0 s).  The kettle
                     moves on a minutes time-scale; 1 s loses nothing.
@@ -89,17 +91,22 @@ from scipy.signal import lfilter
 def load_csv(path: str) -> pd.DataFrame:
   df = pd.read_csv(path, comment='#')
   df.columns = df.columns.str.strip()
-  required = ['t_monotonic_s', 'temp_filt_c', 'p_delivered_w']
+  required = ['t_monotonic_s', 'temp_filt_c', 'p_demand_w']
   missing = [c for c in required if c not in df.columns]
   if missing:
     sys.exit(f"CSV is missing required columns: {missing} "
              "(pre-rebuild duty-format logs are not supported)")
-  df = df[required].apply(pd.to_numeric, errors='coerce').dropna()
+  cols = required + (['watchdog'] if 'watchdog' in df.columns else [])
+  df = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
   df = df.sort_values('t_monotonic_s').reset_index(drop=True)
   if len(df) < 100:
     sys.exit(f"Only {len(df)} usable rows in the log.")
-  if float(df['p_delivered_w'].abs().max()) < 1.0:
-    sys.exit("p_delivered_w is zero throughout — the SSRs never fired. "
+  # The demand is the delivered power, except while the ZC watchdog holds
+  # the SSRs off.
+  if 'watchdog' in df.columns:
+    df.loc[df['watchdog'] != 0, 'p_demand_w'] = 0.0
+  if float(df['p_demand_w'].abs().max()) < 1.0:
+    sys.exit("p_demand_w is zero throughout — no power was applied. "
              "Nothing to identify.")
   return df
 
@@ -114,7 +121,7 @@ def resample(df: pd.DataFrame, dt: float):
   """
   t = df['t_monotonic_s'].values - df['t_monotonic_s'].values[0]
   T = df['temp_filt_c'].values.astype(float)
-  P = df['p_delivered_w'].values.astype(float)
+  P = df['p_demand_w'].values.astype(float)
   idx = np.floor(t / dt).astype(int)
   n = int(idx[-1]) + 1
   cnt = np.bincount(idx, minlength=n).astype(float)
@@ -356,7 +363,7 @@ def main():
   ap.add_argument('--ambient', type=float, required=True, metavar='C',
                   help='Room / ambient temperature during the test [°C] (required)')
   ap.add_argument('--volume-l', type=float, default=None, metavar='L',
-                  help='Water volume [L]; cross-checks the delivered watts')
+                  help='Water volume [L]; cross-checks the rated element watts')
   ap.add_argument('--dt', type=float, default=1.0, metavar='SEC',
                   help='Resample period for the fit (default 1.0 s)')
   ap.add_argument('--rule', choices=['simc', 'zn', 'cc', 'all'], default='simc',
@@ -386,7 +393,7 @@ def main():
   # ── Phases ───────────────────────────────────────────────────────────────
   phases = find_phases(tg, Pg, dt)
   print()
-  print("── Power phases (from p_delivered_w) ──────────────────────────")
+  print("── Power phases (from p_demand_w) ─────────────────────────────")
   for ph in phases:
     i0, i1 = ph['i0'], ph['i1']
     dur = (i1 - i0 + 1) * dt
@@ -495,11 +502,11 @@ def main():
     mc_water = args.volume_l * 4186.0
     ratio = mc / mc_water
     print()
-    print("── Delivered-watts cross-check ────────────────────────────────")
+    print("── Element-watts cross-check ──────────────────────────────────")
     print(f"  m fit / water put in = {mc / 4186:.1f} L / {args.volume_l:.1f} L = {ratio:.3f}")
     print(f"  The kettle, elements, pump and hoses add a litre or two of equivalent water,")
     print(f"  so a ratio a little above 1 is expected.  Anything beyond that means the")
-    print(f"  elements delivered about {100.0 / ratio:.0f} % of what bibby.ini calls their")
+    print(f"  elements put out about {100.0 / ratio:.0f} % of what bibby.ini calls their")
     print(f"  rated watts (mains below the rating voltage, element resistance tolerance,")
     print(f"  SSR drop).  The gains and feedforward above are still right: the controller,")
     print(f"  the log and this fit all use the same nominal watts, so the factor cancels")
@@ -597,7 +604,7 @@ def main():
   ax1.grid(True, alpha=0.3)
 
   ax2 = axes[1]
-  ax2.plot(tg, Pg, color='darkorange', lw=1.2, label='p_delivered_w')
+  ax2.plot(tg, Pg, color='darkorange', lw=1.2, label='p_demand_w')
   ax2.set_ylabel('Power (W)')
   ax2.legend(fontsize=7)
   ax2.grid(True, alpha=0.3)

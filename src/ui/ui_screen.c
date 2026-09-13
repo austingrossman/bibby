@@ -40,7 +40,7 @@ static struct {
   lv_obj_t *fault_band, *lbl_fault, *lbl_status;
 
   lv_chart_series_t *s_set, *s_filt, *s_raw, *s_grain_ev, *s_mode_ev;
-  lv_chart_series_t *s_demand, *s_deliv, *s_ff, *s_p, *s_i, *s_d;
+  lv_chart_series_t *s_demand, *s_ff, *s_p, *s_i, *s_d;
 
   uint32_t filt_series_idx;  // insertion index of s_filt (see the draw hook)
 
@@ -53,7 +53,7 @@ static struct {
 // Chart ext arrays (LVGL reads these directly; we own the memory).
 static int32_t a_set[CHART_MAX_PTS], a_filt[CHART_MAX_PTS], a_raw[CHART_MAX_PTS];
 static int32_t a_grain_ev[CHART_MAX_PTS], a_mode_ev[CHART_MAX_PTS];
-static int32_t a_demand[CHART_MAX_PTS], a_deliv[CHART_MAX_PTS], a_ff[CHART_MAX_PTS];
+static int32_t a_demand[CHART_MAX_PTS], a_ff[CHART_MAX_PTS];
 static int32_t a_p[CHART_MAX_PTS], a_i[CHART_MAX_PTS], a_d[CHART_MAX_PTS];
 static HistPoint snap[CHART_MAX_PTS];
 
@@ -62,7 +62,7 @@ static HistPoint snap[CHART_MAX_PTS];
 // off the terms you are not watching zooms the pane onto the rest.
 enum {
   V_SET, V_FILT, V_RAW, V_GRAIN, V_MODE,
-  V_DEMAND, V_DELIV, V_FF, V_P, V_I, V_D, V_COUNT
+  V_DEMAND, V_FF, V_P, V_I, V_D, V_COUNT
 };
 static bool vis[V_COUNT];
 static struct {
@@ -291,7 +291,7 @@ static void update_charts(void) {
   for (int i = 0; i < pts; i++) {
     a_set[i] = a_filt[i] = a_raw[i] = LV_CHART_POINT_NONE;
     a_grain_ev[i] = a_mode_ev[i] = LV_CHART_POINT_NONE;
-    a_demand[i] = a_deliv[i] = a_ff[i] = LV_CHART_POINT_NONE;
+    a_demand[i] = a_ff[i] = LV_CHART_POINT_NONE;
     a_p[i] = a_i[i] = a_d[i] = LV_CHART_POINT_NONE;
   }
 
@@ -313,7 +313,6 @@ static void update_charts(void) {
       a_filt[j]   = (int32_t)(snap[k].temp_filt_c * 100.0f);
       a_raw[j]    = (int32_t)(snap[k].temp_raw_c * 100.0f);
       a_demand[j] = (int32_t)snap[k].p_demand_w;
-      a_deliv[j]  = (int32_t)snap[k].p_delivered_w;
       a_ff[j]     = (int32_t)snap[k].ff_w;
       a_p[j]      = (int32_t)snap[k].p_w;
       a_i[j]      = (int32_t)snap[k].i_w;
@@ -334,7 +333,6 @@ static void update_charts(void) {
 
     int32_t plo = INT32_MAX, phi = INT32_MIN;
     if (vis[V_DEMAND]) fold(a_demand[i], &plo, &phi);
-    if (vis[V_DELIV])  fold(a_deliv[i],  &plo, &phi);
     if (vis[V_FF])     fold(a_ff[i],     &plo, &phi);
     if (vis[V_P])      fold(a_p[i],      &plo, &phi);
     if (vis[V_I])      fold(a_i[i],      &plo, &phi);
@@ -569,7 +567,6 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
   lv_obj_add_event_cb(S.chart_temp, temp_chart_task_cb, LV_EVENT_DRAW_TASK_ADDED,
                       NULL);
 
-  S.s_deliv  = add_series(S.chart_pow, 0xa06428, a_deliv);
   S.s_ff     = add_series(S.chart_pow, UI_TEAL, a_ff);
   S.s_p      = add_series(S.chart_pow, UI_BLUE, a_p);
   S.s_i      = add_series(S.chart_pow, UI_VIOLET, a_i);
@@ -588,7 +585,6 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
 
   lv_obj_t *leg2 = make_legend_row(scr, 70, 451, 710);
   make_chip(leg2, V_DEMAND, S.chart_pow, &S.s_demand, UI_ORANGE, "demand W");
-  make_chip(leg2, V_DELIV,  S.chart_pow, &S.s_deliv,  0xc4823f,  "delivered");
   make_chip(leg2, V_FF,     S.chart_pow, &S.s_ff,     UI_TEAL,   "ff");
   make_chip(leg2, V_P,      S.chart_pow, &S.s_p,      UI_BLUE,   "P");
   make_chip(leg2, V_I,      S.chart_pow, &S.s_i,      UI_VIOLET, "I");

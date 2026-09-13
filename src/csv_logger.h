@@ -12,8 +12,7 @@ typedef struct {
   float    temp_raw_c;
   float    temp_filt_c;
   float    setpoint_c;
-  float    p_demand_w;      // control-law output before the split
-  float    p_delivered_w;   // measured from fired half-cycles
+  float    p_demand_w;      // control-law output before the split = delivered power
   float    duty1, duty2;
   float    flux1_w_cm2, flux2_w_cm2;
   PidTerms pid;

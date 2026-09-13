@@ -464,8 +464,7 @@ time axis (last few minutes, scrolling):
   single most useful tuning view — it shows whether the integrator is doing the
   holding work (it should not, if feedforward is sized right), whether D is just
   amplifying noise, and how the terms trade off during a transient.
-- **SSR fired state / actual delivered power**, to confirm the modulator is
-  tracking the command.
+- **SSR fired state**, to confirm the modulator is tracking the command.
 - **Event markers:** grain-in, mode changes, setpoint changes — align brew events
   to the trace.
 

@@ -52,13 +52,13 @@ static void window_stats(const MassEstimator *e, double *slope_c_per_s,
 }
 
 void mass_estimator_push(MassEstimator *e, double t_s, float temp_filt_c,
-                         float p_delivered_w) {
+                         float p_w) {
   if (t_s - e->last_store_t < MASS_STORE_DT_S) return;
   e->last_store_t = t_s;
 
   e->buf[e->head].t    = t_s;
   e->buf[e->head].temp = temp_filt_c;
-  e->buf[e->head].p    = p_delivered_w;
+  e->buf[e->head].p    = p_w;
   e->head = (e->head + 1) % MASS_EST_CAP;
   if (e->count < MASS_EST_CAP) e->count++;
 

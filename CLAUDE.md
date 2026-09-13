@@ -33,8 +33,8 @@ rebuild followed is in `docs/REBUILD.md`. README §2 has the architecture diagra
   `simulate_zc` on, that same timeout *is* the fake crossing (bench testing without mains).
 - **Control-staleness watchdog:** the sampler bumps `control_heartbeat` every pass; if it
   freezes for `config_staleness_zc()` crossings (~2 s), both duties are forced to 0.
-- Counts `zc_count`, `fired1`, `fired2` (the sampler turns fired half-cycles into measured
-  delivered watts). Drives the SSRs low on the way out and clears `running`.
+- Counts `zc_count` (headless status line). Drives the SSRs low on the way out and clears
+  `running`.
 
 ### sampler thread — `src/sampler_thread.c`
 Everything paced by the RTD conversion rate; one pass = heartbeat + read + control + log.
@@ -46,8 +46,8 @@ Everything paced by the RTD conversion rate; one pass = heartbeat + read + contr
 - Grain In swaps the gain set (`[grain]`) and optionally lowers peak power.
 - Manual publishes duty every pass (a dead sensor must not freeze the slider); auto runs the
   control law once per fresh sample.
-- Slow tick (0.5 s): measured delivered power from the fired counters, batch-size estimate, chart
-  history push (~2 Hz into the `HISTORY_CAP` ring).
+- Slow tick (0.5 s): batch-size estimate, chart history push (~2 Hz into the `HISTORY_CAP`
+  ring).
 - Logging: one CSV row per fresh sample; during a fault, one row per slow tick so the outage
   and its fault bits stay on disk.
 - Bench hook: `BIBBY_TEST_WEDGE=<sec>` wedges this thread once, 5 s in, to exercise the
@@ -67,7 +67,7 @@ Everything paced by the RTD conversion rate; one pass = heartbeat + read + contr
   `ui_kettle.c` = the kettle cutaway with element glow, `ui_theme.h` = the palette.
 - Screen: kettle card (setpoint, °C/°F, per-element duty), POWER slider (commands watts in
   manual, read-only live demand in auto), ±10/±1/±0.1 setpoint steppers, ZC Sim / Grain In /
-  Manual Control toggles, temperature chart, power chart (demand/delivered/ff/P/I/D), fault
+  Manual Control toggles, temperature chart, power chart (demand/ff/P/I/D), fault
   band, batch-size (`m xx.x L`) + adaptive-scale status line. Refresh timer at 250 ms, charts
   every other tick.
 - Each chart carries a row of legend chips; tapping one hides that trace and drops it from
@@ -132,9 +132,9 @@ quantity; it appears for the first time in the power split.
   `power.max_flux_w_cm2 > 0` caps total demand at `flux × (A1 + A2)`. E1% and E2% differ by
   design.
 - `src/mass_estimator.{h,c}` — online batch size: over a stretch of roughly constant
-  delivered power with ≥1 °C rise, thermal mass `P / (dT/dt)` in J/°C, reported as litres of
-  water `m = (P / slope) / 4186`. Reads high by the kettle's own mass and by 1/(delivered ÷
-  rated watts). Always computed and logged (`m_est_l`); only `[adaptive]` (`m_ref_l`) decides
+  commanded power with ≥1 °C rise, thermal mass `P / (dT/dt)` in J/°C, reported as litres of
+  water `m = (P / slope) / 4186`. Reads high by the kettle's own mass and by 1/(actual ÷
+  rated element watts). Always computed and logged (`m_est_l`); only `[adaptive]` (`m_ref_l`) decides
   whether it scales `kp`/`kd`.
 - `src/temp_filter.{h,c}` — cascaded boxcar, `filter.order` stages × `filter.window` samples.
   Group delay `order*(window−1)/2` samples feeds the dead-time term used for tuning.
@@ -151,10 +151,10 @@ chart history ring.
 | `control_heartbeat` | sampler | ssr | staleness watchdog |
 | `output1`, `output2` | ssr | ui | SSR fired state this half-cycle |
 | `watchdog_alarm` | ssr | sampler, ui | no ZC within the mains-derived timeout |
-| `zc_count`, `fired1`, `fired2` | ssr | sampler | delivered-power measurement |
+| `zc_count` | ssr | main (headless) | zero crossings seen (real or simulated) |
 | `temp_raw_c`, `temp_filt_c`, `temp_valid` | sampler | ui | temperature |
 | `rtd_fault`, `rtd_unresponsive` | sampler | ui | MAX31865 fault bits / silent DRDY |
-| `p_demand_w`, `p_delivered_w`, `m_est_l`, `adaptive_scale` | sampler | ui | loop telemetry |
+| `p_demand_w`, `m_est_l`, `adaptive_scale` | sampler | ui, web | loop telemetry |
 | `fault_forced_manual` | sampler | ui | auto was blocked/kicked by a sensor fault |
 | `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in` | ui | sampler | operator commands |
 | `running` | any | all | clear to shut the process down |
@@ -165,12 +165,13 @@ chart history ring.
   sample, ~50/60 Hz, for tuning); `low` = decimated to one row per `low_period_s`.
 - Every row is `fflush`ed so a crash mid-brew keeps the data on disk.
 - Columns: `wall_time, t_monotonic_s, temp_raw_c, temp_filt_c, setpoint_c, p_demand_w,
-  p_delivered_w, duty1, duty2, flux1_w_cm2, flux2_w_cm2, pid_ff_w, pid_p_w, pid_i_w,
-  pid_d_w, pid_integral, pid_deriv, pid_error_c, m_est_l, manual, grain_in,
-  rtd_fault, watchdog`. `wall_time` is ISO-8601 local with ms; there is no `dt` column —
+  duty1, duty2, flux1_w_cm2, flux2_w_cm2, pid_ff_w, pid_p_w, pid_i_w, pid_d_w,
+  pid_integral, pid_deriv, pid_error_c, m_est_l, manual, grain_in, rtd_fault, watchdog`.
+  Logs written before 2026-09-13 also carry a `p_delivered_w` column after `p_demand_w`;
+  every reader looks columns up by name, so both open. `wall_time` is ISO-8601 local with ms; there is no `dt` column —
   recover time from `wall_time` or `t_monotonic_s`.
 - `tools/plot_logs.py` browses/plots the logs; `tools/identify_plant.py` drives the lumped
-  kettle model with the logged `p_delivered_w` and fits m (litres), k_loss, L by least squares
+  kettle model with the logged `p_demand_w` (0 W while `watchdog`) and fits m (litres), k_loss, L by least squares
   (heat-then-cool test, whole log, `--ambient` required), then prints PID/feedforward blocks.
   `--lambda` sets SIMC's τc (README §9.5); the shipped gains use τc = 30 s.
 

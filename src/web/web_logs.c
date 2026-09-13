@@ -14,7 +14,7 @@
 // still plots whatever columns it does have.
 static const char *const kCols[] = {
   "t_monotonic_s", "temp_raw_c", "temp_filt_c", "setpoint_c",
-  "p_demand_w", "p_delivered_w", "duty1", "duty2",
+  "p_demand_w", "duty1", "duty2",
   "pid_ff_w", "pid_p_w", "pid_i_w", "pid_d_w",
   "m_est_l", "manual", "grain_in", "rtd_fault", "watchdog",
 };

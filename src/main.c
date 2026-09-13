@@ -86,13 +86,12 @@ static void headless_loop(BibbyState *st) {
   while (atomic_load(&st->running)) {
     struct timespec ts = { 2, 0 };
     nanosleep(&ts, NULL);
-    printf("t=%.1f temp=%.2fC duty=%.2f/%.2f demand=%.0fW delivered=%.0fW "
+    printf("t=%.1f temp=%.2fC duty=%.2f/%.2f demand=%.0fW "
            "zc=%u wdog=%d fault=0x%02x%s\n",
            bibby_now_s(),
            (double)atomic_load(&st->temp_filt_c),
            (double)atomic_load(&st->duty1), (double)atomic_load(&st->duty2),
            (double)atomic_load(&st->p_demand_w),
-           (double)atomic_load(&st->p_delivered_w),
            atomic_load(&st->zc_count),
            atomic_load(&st->watchdog_alarm) ? 1 : 0,
            atomic_load(&st->rtd_fault),

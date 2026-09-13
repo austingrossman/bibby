@@ -88,7 +88,7 @@ static void route_state(HttpReq *r) {
   Buf b = {0};
   buf_printf(&b,
              "{\"temp_c\":%.2f,\"temp_raw_c\":%.2f,\"temp_valid\":%s,"
-             "\"setpoint_c\":%.2f,\"p_demand_w\":%.0f,\"p_delivered_w\":%.0f,"
+             "\"setpoint_c\":%.2f,\"p_demand_w\":%.0f,"
              "\"duty1\":%.3f,\"duty2\":%.3f,\"manual\":%s,\"grain_in\":%s,"
              "\"rtd_fault\":%u,\"rtd_unresponsive\":%s,\"watchdog\":%s,"
              "\"fault_forced_manual\":%s,\"m_est_l\":%.1f}",
@@ -97,7 +97,6 @@ static void route_state(HttpReq *r) {
              atomic_load(&s->temp_valid) ? "true" : "false",
              (double)atomic_load(&s->setpoint_c),
              (double)atomic_load(&s->p_demand_w),
-             (double)atomic_load(&s->p_delivered_w),
              (double)atomic_load(&s->duty1), (double)atomic_load(&s->duty2),
              atomic_load(&s->manual_mode) ? "true" : "false",
              atomic_load(&s->grain_in) ? "true" : "false",
