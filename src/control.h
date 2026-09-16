@@ -20,6 +20,12 @@
 // has only a few tens of watts to trim, and there is nothing useful for it to
 // learn while the temperature is still degrees away. i_band_c = 0 integrates
 // always (the classic PI).
+//
+// Integral clamp: when i_clamp_w > 0 the integral TERM is bounded to
+// +/- i_clamp_w watts (the state is clamped to i_clamp_w/ki), so however long
+// the loop sits with an error the integrator can only ever add or subtract
+// that much power. It is a hard authority limit on top of the conditional
+// integration, and the tighter of it and the max_power/ki backstop wins.
 
 // Breakdown of the most recent update, for logging/tuning/chart.
 typedef struct {
@@ -36,6 +42,7 @@ typedef struct {
 typedef struct {
   float kp, ki, kd;
   float i_band_c;   // integral-separation band, degC; 0 = integrate always
+  float i_clamp_w;  // +/- bound on the integral term, W; 0 = backstop only
   float integral;
   float prev_error;
   int   has_prev;
@@ -47,6 +54,11 @@ void pid_init(Pid *pid, float kp, float ki, float kd);
 // Set the integral-separation band (degC, 0 = off). Kept across
 // pid_set_gains(): the band is a property of the approach, not the gain set.
 void pid_set_i_band(Pid *pid, float i_band_c);
+
+// Set the symmetric bound on the integral term (watts, 0 = off). Like the
+// band, it survives pid_set_gains() — it is a statement about how much
+// authority the integrator may ever have, not part of a gain set.
+void pid_set_i_clamp(Pid *pid, float i_clamp_w);
 
 // Clear the integrator and derivative history (on mode or gain-set change).
 void pid_reset(Pid *pid);
