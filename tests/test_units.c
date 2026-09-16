@@ -138,6 +138,25 @@ static void test_control(void) {
   for (int i = 0; i < 100000; i++) pid_update(&pid, 64.9f, 65, 0, 1000, 1.0f);
   CHECK(pid.terms.i_w <= 1000.0f + 1e-3);
 
+  // Integral clamp: the term is bounded to +/- i_clamp_w, well inside the
+  // out_max/ki backstop, and symmetrically on the negative side.
+  pid_init(&pid, 0, 2.0f, 0);
+  pid_set_i_clamp(&pid, 500.0f);
+  for (int i = 0; i < 100000; i++) pid_update(&pid, 64.9f, 65, 0, 10000, 1.0f);
+  CHECK_NEAR(pid.terms.i_w, 500.0, 1e-3);
+  for (int i = 0; i < 100000; i++) pid_update(&pid, 65.1f, 65, 2000, 10000, 1.0f);
+  CHECK_NEAR(pid.terms.i_w, -500.0, 1e-3);
+  // The tighter of the clamp and the backstop wins: out_max/ki = 200 W here.
+  pid_init(&pid, 0, 2.0f, 0);
+  pid_set_i_clamp(&pid, 500.0f);
+  for (int i = 0; i < 100000; i++) pid_update(&pid, 64.9f, 65, 0, 200, 1.0f);
+  CHECK_NEAR(pid.terms.i_w, 200.0, 0.05);  // the 200 W rail, not the 500 W clamp
+  // The clamp survives a gain-set swap, and a non-positive value turns it off.
+  pid_set_gains(&pid, 0, 2.0f, 0);
+  CHECK_NEAR(pid.i_clamp_w, 500.0, 1e-6);
+  pid_set_i_clamp(&pid, 0.0f);
+  CHECK(pid.i_clamp_w == 0.0f);
+
   // Integral separation: outside the band the integrator holds; inside it
   // accumulates; a gain-set swap keeps the band.
   pid_init(&pid, 0, 10.0f, 0);
@@ -244,7 +263,8 @@ static void test_config(void) {
   CHECK(cfg.pid_kp == 0.0f);
   CHECK(cfg.pid_i_band_c == 0.0f);
   CHECK(cfg.log_high_rate);
-  CHECK(cfg.ui_show_zc_sim);
+  CHECK(!cfg.mains_simulate_zc);
+  CHECK(cfg.pid_i_clamp_w == 0.0f);
   CHECK(cfg.ui_rotation == 90);
   CHECK(!strcmp(cfg.ui_fb_device, "auto"));
 
@@ -259,34 +279,35 @@ static void test_config(void) {
   const char *path = "/tmp/bibby_test.ini";
   FILE *f = fopen(path, "w");
   fprintf(f,
-    "[mains]\nfrequency_hz = 50\n"
+    "[mains]\nfrequency_hz = 50\nsimulate_zc = true\n"
     "[element1]\nwatts = 5000 ; comment\narea_cm2 = 820\n"
     "[element2]\nwatts = 5500\narea_cm2 = 473\n"
     "[power]\nmax_flux_w_cm2 = 4.5\n"
-    "[pid]\nkp = 350\nki = 0.02\nkd = 10\ni_band_c = 0.75\n"
+    "[pid]\nkp = 350\nki = 0.02\nkd = 10\ni_band_c = 0.75\ni_clamp_w = 500\n"
     "[grain]\nkp = 200\nki = 0.01\nkd = 5\nmax_power_w = 6000\n"
     "[feedforward]\nprocess_gain_c = 0.011\nambient_c = 18\n"
     "[sensor]\nref_resistor_ohms = 397.82\ntemp_cal_gain = 1.0528\ntemp_cal_offset = -0.032\n"
     "[filter]\norder = 3\nwindow = 20\n"
     "[logging]\nrate = low\nlow_period_s = 1.5\n"
-    "[ui]\nshow_zc_sim = false\nchart_window_min = 10\nrotation = 270\nfb_device = /dev/fb1\ntouch_device = /dev/input/event1\n"
+    "[ui]\nchart_window_min = 10\nrotation = 270\nfb_device = /dev/fb1\ntouch_device = /dev/input/event1\n"
     "[adaptive]\nenable = true\nm_ref_l = 45\nscale_min = 0.6\nscale_max = 3\n");
   fclose(f);
 
   CHECK(config_load(&cfg, path));
   CHECK(cfg.mains_hz == 50);
+  CHECK(cfg.mains_simulate_zc);
   CHECK_NEAR(cfg.element1_watts, 5000, 1e-6);
   CHECK_NEAR(cfg.element2_area_cm2, 473, 1e-6);
   CHECK_NEAR(cfg.max_flux_w_cm2, 4.5, 1e-6);
   CHECK_NEAR(cfg.pid_kp, 350, 1e-6);
   CHECK_NEAR(cfg.pid_i_band_c, 0.75, 1e-6);
+  CHECK_NEAR(cfg.pid_i_clamp_w, 500, 1e-6);
   CHECK_NEAR(cfg.grain_max_power_w, 6000, 1e-6);
   CHECK_NEAR(cfg.ff_process_gain_c, 0.011, 1e-9);
   CHECK_NEAR(cfg.sensor_ref_resistor_ohms, 397.82, 1e-4);
   CHECK(cfg.filter_order == 3 && cfg.filter_window == 20);
   CHECK(!cfg.log_high_rate);
   CHECK_NEAR(cfg.log_low_period_s, 1.5, 1e-6);
-  CHECK(!cfg.ui_show_zc_sim);
   CHECK(cfg.ui_rotation == 270);
   CHECK(!strcmp(cfg.ui_fb_device, "/dev/fb1"));
   CHECK(!strcmp(cfg.ui_touch_device, "/dev/input/event1"));

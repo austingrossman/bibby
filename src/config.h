@@ -13,6 +13,12 @@ typedef struct {
   // and the MAX31865 noise-rejection notch. 50 or 60.
   int   mains_hz;
 
+  // [mains] — bench mode: treat every ZC-watchdog timeout as a zero crossing
+  // so the modulator, control law and UI run with no AC connected. There is no
+  // operator control for this; it is a deliberate config/commissioning choice,
+  // and `--sim-zc` on the command line forces it on for a single run.
+  bool  mains_simulate_zc;
+
   // [element1]/[element2] — rated power and wetted surface area per element.
   // Used by the equal-flux power split and the anti-scorch cap.
   float element1_watts;
@@ -32,6 +38,10 @@ typedef struct {
   // Integral-separation band, degC: the integrator only accumulates while
   // |error| <= band. 0 = integrate always. Applies to both gain sets.
   float pid_i_band_c;
+  // Symmetric clamp on the integral TERM, watts: |ki * integral| <= this.
+  // 0 = no explicit clamp (the built-in backstop of full output authority,
+  // max_power/ki, still applies). Applies to both gain sets.
+  float pid_i_clamp_w;
 
   // [grain] — gains used while the Grain In toggle is set, plus a lower peak
   // power for the loaded kettle. grain_max_power_w = 0 means no extra cap.
@@ -62,11 +72,9 @@ typedef struct {
   bool  log_high_rate;
   float log_low_period_s;
 
-  // [ui] — show_zc_sim hides the ZC Sim button after hardware checkout.
-  // chart_window_min is the scrolling graph span. fb_device/touch_device are
-  // device paths, or "auto" to probe. rotation (0/90/180/270) maps the UI onto
-  // the sideways-mounted panel.
-  bool  ui_show_zc_sim;
+  // [ui] — chart_window_min is the scrolling graph span. fb_device/touch_device
+  // are device paths, or "auto" to probe. rotation (0/90/180/270) maps the UI
+  // onto the sideways-mounted panel.
   float ui_chart_window_min;
   int   ui_rotation;
   char  ui_fb_device[64];

@@ -31,6 +31,8 @@ rebuild followed is in `docs/REBUILD.md`. README §2 has the architecture diagra
   acc ≥ 1.0, accumulator capped at 2.0.
 - **ZC watchdog:** timeout with no edge → both SSRs off, `watchdog_alarm` set. With
   `simulate_zc` on, that same timeout *is* the fake crossing (bench testing without mains).
+  `simulate_zc` comes from `mains.simulate_zc` (or `--sim-zc`), is set once before the
+  threads start, and has **no panel control** — with it on this watchdog can never trip.
 - **Control-staleness watchdog:** the sampler bumps `control_heartbeat` every pass; if it
   freezes for `config_staleness_zc()` crossings (~2 s), both duties are forced to 0.
 - Counts `zc_count` (headless status line). Drives the SSRs low on the way out and clears
@@ -66,14 +68,21 @@ Everything paced by the RTD conversion rate; one pass = heartbeat + read + contr
   for checking rotation and touch mapping). `ui_screen.c` = the controller screen,
   `ui_kettle.c` = the kettle cutaway with element glow, `ui_theme.h` = the palette.
 - Screen: kettle card (setpoint, °C/°F, per-element duty), POWER slider (commands watts in
-  manual, read-only live demand in auto), ±10/±1/±0.1 setpoint steppers, ZC Sim / Grain In /
-  Manual Control toggles, temperature chart, power chart (demand/ff/P/I/D), fault
-  band, batch-size (`m xx.x L`) + adaptive-scale status line. Refresh timer at 250 ms, charts
-  every other tick.
+  manual, read-only live demand in auto; 104 px wide for a thumb), ±10/±1/±0.1 setpoint
+  steppers, two 180x160 square toggles (Grain In / Manual Control), temperature chart, power
+  chart (demand/ff/P/I/D), fault band. Each chart has a legend row above and a static time
+  scale below (`make_time_axis()`, six marks from `-<window>m` to `now`, placed on the
+  chart's own content box so they land on its vertical grid lines). Both panes run from
+  under the toggles to the bottom edge; the fault band gets no reserved strip and instead
+  floats over the lower power chart when it appears. The setpoint reads out in
+  °C and °F above the kettle, the measured temperature in °C and °F at the same size inside
+  it (°F one step darker), and the batch-size estimate rides on the kettle contents in litres
+  and gallons (`ui_kettle_set_mass()`), with the per-element duties and the adaptive-scale
+  status line closing out that column. Refresh timer at 250 ms, charts every other tick.
 - Each chart carries a row of legend chips; tapping one hides that trace and drops it from
   that chart's autoscale (`vis[]` / `trace[]` in `ui_screen.c`). All traces start visible.
 - **The UI owns no control or safety logic.** It reads the state snapshot and writes only
-  `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in`, `simulate_zc`.
+  `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in`.
 
 ### web — `src/web/` (optional, off by default)
 Enabled only by `[web]` in `bibby.ini` **with a password set**; the server refuses to
@@ -121,7 +130,9 @@ quantity; it appears for the first time in the power split.
   `(setpoint − ambient)/K` watts is added ahead of the feedback, so the PID only trims model
   error. Conditional-integration anti-windup (hold the integrator when the pre-step output is
   already railed and the error pushes further in), plus an integral backstop of
-  `out_max_w / ki`. **Integral separation** (`pid.i_band_c`, °C): the integrator also holds
+  `out_max_w / ki`, and a configured symmetric bound on the integral term
+  (`pid.i_clamp_w`, watts; 0 = backstop only — 500 W as shipped, applied every step whether
+  or not the integrator moved). **Integral separation** (`pid.i_band_c`, °C): the integrator also holds
   while `|error|` is outside the band — the kettle is an integrating plant, so error soaked
   up during the approach is repaid as overshoot after the crossing (the whole 0.73 °C of the
   2026-09-07 ramp test); with feedforward carrying the holding power there is nothing for it
@@ -147,7 +158,7 @@ chart history ring.
 | Field | Writer | Reader | Purpose |
 |---|---|---|---|
 | `duty1`, `duty2` | sampler | ssr | per-element duty command [0,1] |
-| `simulate_zc` | ui | ssr | treat ZC timeouts as crossings (bench) |
+| `simulate_zc` | main (startup) | ssr | treat ZC timeouts as crossings (bench) |
 | `control_heartbeat` | sampler | ssr | staleness watchdog |
 | `output1`, `output2` | ssr | ui | SSR fired state this half-cycle |
 | `watchdog_alarm` | ssr | sampler, ui | no ZC within the mains-derived timeout |
@@ -214,6 +225,8 @@ chart history ring.
 - INI format: `[section]` headers, `key = value`, `#`/`;` comments (inline too). Sections:
   `[mains] [element1] [element2] [power] [pid] [grain] [feedforward] [sensor] [filter]
   [logging] [ui] [web] [adaptive]`. README §7 has the full key table with defaults.
+  `mains.simulate_zc` and `pid.i_clamp_w` are config-only by design: one disarms a
+  watchdog, the other bounds actuator authority, and neither belongs on the panel.
   Because `#`/`;` start a comment anywhere on a line, `web.password` may not contain
   either character.
 - Derived helpers: `config_zc_timeout_ns()` = half-period + 0.7 ms guard (60 Hz → 9.0 ms,

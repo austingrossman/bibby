@@ -122,7 +122,8 @@ no locks on the hot paths. Key fields:
 | `duty1`, `duty2` | sampler | per-element duty commands in `[0,1]` |
 | `p_demand_w` | sampler | commanded power — also the delivered average power (§2.3) |
 | `temp_raw_c`, `temp_filt_c`, `temp_valid` | sampler | latest sensor sample and validity |
-| `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in`, `simulate_zc` | UI | user intent |
+| `setpoint_c`, `manual_mode`, `manual_power_w`, `grain_in` | UI | user intent |
+| `simulate_zc` | main, at startup | bench zero-cross simulation (`mains.simulate_zc` / `--sim-zc`); never changes while running |
 | `output1`, `output2`, `zc_count`, `watchdog_alarm` | SSR thread | fired state, ZC counter, ZC watchdog |
 | `control_heartbeat` | sampler | bumped every loop pass; the SSR thread's staleness watchdog watches it |
 | `rtd_fault`, `rtd_unresponsive`, `fault_forced_manual` | sampler | sensor-fault state |
@@ -168,8 +169,12 @@ Runs at `SCHED_FIFO` (real-time) priority, pinned to the AC zero crossing:
    commanded duty with the switching energy pushed to high frequency.
 3. **Zero-cross watchdog.** No edge within the timeout → both SSRs forced off,
    `watchdog_alarm` set. A lost mains-sense signal must not leave a relay
-   latched on. `simulate_zc` (the UI's "ZC Sim" toggle) substitutes the timeout
-   tick for the edge so the modulator can be exercised with no mains connected.
+   latched on. `simulate_zc` substitutes the timeout tick for the edge so the
+   modulator can be exercised with no mains connected. It is set once at
+   startup from `mains.simulate_zc` (or `--sim-zc`) and there is deliberately
+   **no control for it on the panel**: while it is on this watchdog can never
+   trip, which is a commissioning decision, not something a stray tap during a
+   brew should be able to do. Startup logs a warning line whenever it is on.
 4. **Control-staleness watchdog.** The sampler bumps `control_heartbeat` every
    pass; if it stops advancing for ~2 s worth of zero crossings
    (`2 × mains_Hz`), duties are forced to zero — a wedged control loop must not
@@ -183,8 +188,17 @@ Runs at `SCHED_FIFO` (real-time) priority, pinned to the AC zero crossing:
 `clamp(ff + p + i + d, 0, max_power)` in watts. Anti-windup is **conditional
 integration**: the integrator holds whenever the non-integral output is already
 against a rail and the error would push further into it; a backstop clamps the
-integral term to full output authority (`max_power / ki`). No hand-tuned clamp
-constant exists — the bounds all derive from the configured elements.
+integral term to full output authority (`max_power / ki`).
+
+**Integral clamp** (`pid.i_clamp_w`, watts; 0 = off). On top of that, the
+integral *term* is bounded to ±`i_clamp_w` — the accumulator itself is held to
+`i_clamp_w / ki`, every step, whether or not the integrator was allowed to
+move. It is a statement of how much authority the integrator may ever have:
+with the feedforward carrying the holding power, all the integrator has to
+trim is model error, so it never needs kilowatts. The shipped value is 500 W,
+about 5 % of the installed 10.5 kW — enough to absorb a wrong ambient or a
+drifting `k_loss`, far too little to run away with the kettle. The tighter of
+this and the `max_power / ki` backstop wins, and it applies to both gain sets.
 
 **Integral separation** (`pid.i_band_c`, °C; 0 = off). The integrator only
 accumulates while `|error| ≤ i_band_c`; outside the band it holds its value,
@@ -277,14 +291,28 @@ LVGL 9.3 rendering directly to the framebuffer:
   mounted sideways, so the UI renders 1280×720 and LVGL software-rotates 90°
   into the 720×1280 framebuffer (`ui.rotation`). Touch comes from the first
   evdev device advertising absolute multitouch (`ui.touch_device = auto`).
-- **Layout:** toggles (ZC Sim, Grain In, Manual Control) and ±10/±1/±0.1
-  setpoint steppers on top; temperature chart (setpoint, filtered, raw, grain
-  and mode-change markers) and power/PID-term chart below, each under a row of
-  tappable legend chips that show/hide individual traces; vertical power
-  slider (manual watts in manual, live demand readout in auto); kettle graphic
-  whose element glow follows the commanded duties; fault band (decoded RTD
-  faults, watchdog, forced-manual notice); status line (batch-size estimate
-  in litres and adaptive scale).
+- **Layout:** two large square toggles (Grain In, Manual Control) and the
+  ±10/±1/±0.1 setpoint steppers on top; temperature chart (setpoint, filtered,
+  raw, grain and mode-change markers) and power/PID-term chart below, each
+  between a row of tappable legend chips above and a time scale below; a wide
+  vertical power slider (manual watts in manual, live demand readout in auto);
+  kettle graphic whose element glow follows the commanded duties and whose
+  contents carry the batch-size estimate in litres and gallons, with the
+  per-element duties and the adaptive gain scale under it; fault band (decoded
+  RTD faults, watchdog, forced-manual notice).
+- **Time scale:** both charts are right-aligned to *now* and span
+  `ui.chart_window_min`, so the scale is fixed at startup and drawn once —
+  six marks running `-5m … -1m … now` for the default 5-minute window, landing
+  exactly on the chart's vertical grid lines (sub-minute marks read `-0:30`).
+- **No dead space.** The two panes stretch from just under the toggles to the
+  bottom edge. The fault band has no reserved strip: it is hidden nearly
+  always, so it floats over the lower third of the power chart when it
+  appears, which costs nothing — the loop is at zero watts by then.
+- **Sized for fingers, not a mouse.** Every target is a touch target: the two
+  toggles are 180×160, the steppers 120×75, the legend chips 46 px tall, and
+  the power slider is 104 px wide — it is the only continuous control on the
+  screen, so it gets a thumb's worth of track. The one thing the panel
+  deliberately cannot do is arm zero-cross simulation (§2.3).
 - LVGL is pinned to **v9.3.0**: v9.4 breaks the fbdev software-rotation path
   and hangs in `lv_deinit` on shutdown.
 - **Memory (`src/ui/lv_conf.h`):** LVGL's built-in allocator is a fixed pool
@@ -399,11 +427,12 @@ This system switches mains voltage into multi-kilowatt heating elements, so the
 | Heaters off at startup | SSR GPIO lines are requested with output value low before any thread runs |
 | Heaters off on exit/crash | the kernel releases the GPIO lines when the process dies — for any reason — and the SoC pull-downs hold the SSR inputs low; SIGINT/SIGTERM additionally shut down in order |
 | Only one instance | `flock` single-instance guard (`src/single_instance.h`); the kernel drops the lock on any exit |
-| Heaters off if mains-sense (ZC) is lost | mains-derived zero-cross watchdog (~9 ms at 60 Hz) forces SSRs off, raises `watchdog_alarm` |
+| Heaters off if mains-sense (ZC) is lost | mains-derived zero-cross watchdog (~9 ms at 60 Hz) forces SSRs off, raises `watchdog_alarm`. The one thing that defeats it is bench mode (`mains.simulate_zc`, §2.3), which is why it lives in the config file and has no control on the panel |
 | Heaters off if the control loop wedges | control-staleness watchdog: sampler heartbeat stalled for ~2 s of ZCs → duties forced to zero |
 | GUI stalls cannot delay safety logic | the SSR thread runs `SCHED_FIFO`; the UI is not on the control path |
 | No power commanded on unreliable temperature | RTD fault / unresponsive sensor forces manual mode at zero watts; auto is unreachable until the sensor is healthy |
 | Power commands always bounded | demand clamped to the configured element ratings (and the optional flux cap) before splitting; duties clamped to `[0,1]` |
+| The integrator cannot run away | conditional-integration anti-windup, plus a hard ± bound on the integral term (`pid.i_clamp_w`, 500 W as shipped) and the `max_power / ki` backstop (§2.4) |
 | A vanished web client cannot hold a control down | an injected press with no follow-up sample is released after 2 s |
 | Controller returns after a crash | `Restart=always` in the systemd unit (§5.3); SSRs are safe during the gap per the kernel-release mechanism above |
 | Remote control cannot bypass an interlock | the web interface owns no control logic: it injects pointer events into the same LVGL widgets a finger drives (§2.9), so mode interlocks, clamps and watchdogs apply identically |
@@ -630,11 +659,13 @@ All keys, with their defaults:
 | Key | Default | Effect |
 |---|---|---|
 | `mains.frequency_hz` | 60 | ZC watchdog timeout (half-period + 0.7 ms), staleness cutoff (2×Hz ZCs ≈ 2 s), MAX31865 notch (50/60 Hz) |
+| `mains.simulate_zc` | false | **bench only:** treat ZC-watchdog timeouts as zero crossings, so the whole loop runs with no AC connected (§2.3). The mains-loss watchdog cannot trip while it is on, so it is a config switch with no panel control; `--sim-zc` forces it on for one run |
 | `element1.watts` / `element2.watts` | 2500 / 2500 | element ratings; their sum is the maximum power demand |
 | `element1.area_cm2` / `element2.area_cm2` | 150 / 150 | wetted areas driving the equal-flux split |
 | `power.max_flux_w_cm2` | 0 (off) | anti-scorch cap: total demand ≤ flux × total area |
 | `pid.kp` / `ki` / `kd` | 0 | watts-based gains (§9.5); zero = auto commands no power |
 | `pid.i_band_c` | 0 (off) | integral-separation band, °C: the integrator only accumulates within it (§2.4); both gain sets |
+| `pid.i_clamp_w` | 0 (off) | ± bound on the integral term, watts (§2.4); the tighter of this and the `max_power / ki` backstop applies; both gain sets |
 | `grain.kp` / `ki` / `kd` | 0 | alternate gain set while "Grain In" is on |
 | `grain.max_power_w` | 0 (off) | power cap while grain is in |
 | `feedforward.process_gain_c` | 0 (off) | identified K [°C/W]; holding feedforward `(setpoint−ambient)/K` watts |
@@ -644,7 +675,6 @@ All keys, with their defaults:
 | `filter.order` / `filter.window` | 2 / 40 | boxcar cascade stages and window length (§2.6) |
 | `logging.rate` | high | `high` = row per sample (60 Hz); `low` = row per `low_period_s` |
 | `logging.low_period_s` | 2.0 | row period in low-rate mode |
-| `ui.show_zc_sim` | true | show the bench-test ZC Sim toggle (hide for a production panel) |
 | `ui.chart_window_min` | 5 | chart time window, minutes (1–30) |
 | `ui.rotation` | 90 | UI rotation onto the panel: 0/90/180/270 |
 | `ui.fb_device` / `ui.touch_device` | auto | `auto` = `/dev/fb0` / first multitouch evdev; or explicit paths |
@@ -679,18 +709,24 @@ than exiting — the controller and safety logic keep running.
 
 ### UI elements
 
-- **Kettle card:** setpoint, measured °C and °F, animated elements whose glow
-  tracks the commanded duty, per-element duty readout (`E1 x%  E2 y%` — these
-  differ by design; see the equal-flux split, §2.4).
+- **Kettle card:** setpoint in °C and °F above it, the measured temperature in
+  °C and °F at the same size inside it (°F a shade darker, so °C still reads
+  first), the batch-size estimate on the contents in **litres and US gallons**,
+  animated elements whose glow tracks the commanded duty, and a per-element
+  duty readout below (`E1 x%  E2 y%` — these differ by design; see the
+  equal-flux split, §2.4).
 - **POWER slider:** commands watts in manual mode; shows the loop's live demand
-  in auto (disabled for input). Total watts read out under it.
+  in auto (disabled for input). Total watts read out under it. It is 104 px
+  wide — deliberately, for a wet thumb.
 - **Setpoint steppers:** ±10 / ±1 / ±0.1 °C.
-- **Toggles:** ZC Sim (simulate zero crossings — bench only), Grain In (gain
-  set swap + logged event marker), Manual Control (manual watts vs PID auto).
+- **Toggles:** two square pads — Grain In (gain set swap + logged event marker)
+  and Manual Control (manual watts vs PID auto). Zero-cross simulation is not
+  among them; it is `mains.simulate_zc` in the config (§2.3, §7).
 - **Charts:** temperature (setpoint / temp / raw + grain-event and mode-event
   markers — short dashes along the top edge at the samples where Grain In or
   Manual flipped) and power (demand W / ff / P / I / D), window set
-  by `ui.chart_window_min`, y-autoscaled.
+  by `ui.chart_window_min`, y-autoscaled. Each carries a time scale under it
+  reading backwards from `now` to the full window.
 - **Chart legends:** each trace has a chip under its chart — tap to drop that
   trace. A hidden trace is neither drawn nor counted in that chart's autoscale,
   so switching off the terms you are not tuning zooms the pane onto the rest.
@@ -698,7 +734,9 @@ than exiting — the controller and safety logic keep running.
   start visible on every launch.
 - **Fault band:** decoded RTD faults, watchdog alarm, and "Auto disabled →
   manual" when a fault forced the mode switch.
-- **Status line:** batch-size estimate `m` in litres of water and adaptive gain scale.
+- **Status line:** the adaptive gain scale, under the per-element duties at the
+  foot of the kettle column. (The batch-size estimate that drives it is on the
+  kettle contents.)
 
 ### Web interface
 
@@ -759,10 +797,20 @@ the *authorization* is only that password, over plain HTTP:
 - Leave `enable = false` if you do not want any of this; there is no default
   password and the server will not start without one.
 
-**Bench testing without mains:** toggle **ZC Sim** (or start with `--sim-zc`).
-The SSR thread then clocks the sigma-delta from its timeout tick instead of the
-missing zero-cross edge; the full UI, control law, and logging run with no AC
-connected.
+**Bench testing without mains:** set `simulate_zc = true` in `[mains]`, or
+start with `--sim-zc` to avoid editing the file. The SSR thread then clocks the
+sigma-delta from its timeout tick instead of the missing zero-cross edge; the
+full UI, control law, and logging run with no AC connected. Startup prints
+
+```
+bibby: ZERO-CROSS SIMULATION ON (--sim-zc) - the mains-loss watchdog cannot trip; bench use only
+```
+
+**Turn it off before the controller is wired to a kettle.** With it on, losing
+the mains-sense signal looks exactly like normal operation to the SSR thread,
+so the ZC watchdog — one of the interlocks in §3 — is inert. There
+is no toggle for it on the panel for that reason: it should change when the
+unit is on a bench, not when someone is brewing on it.
 
 ---
 
@@ -1194,13 +1242,23 @@ grain). **Validate on your own setup before trusting a batch:**
    feedforward should carry the holding power, the integral only trim, the
    derivative not chatter.
 
-Anti-windup needs no configuration: conditional integration plus the
-`max_power/ki` backstop (§2.4) bound the integrator automatically. Integral
-separation does: keep `pid.i_band_c` at about 0.5 °C (the shipped value) so
-the integrator stays out of the approach. The band should be a little larger
-than the steady-state ripple and any offset the feedforward leaves, and
-smaller than the error at which P leaves full power (`ramp_rate × (τc + L)`
-above), so the integrator wakes up only once the P term is already tapering.
+Anti-windup itself needs no configuration: conditional integration plus the
+`max_power/ki` backstop (§2.4) bound the integrator automatically. Two keys do:
+
+- `pid.i_band_c` — integral separation. Keep it at about 0.5 °C (the shipped
+  value) so the integrator stays out of the approach. The band should be a
+  little larger than the steady-state ripple and any offset the feedforward
+  leaves, and smaller than the error at which P leaves full power
+  (`ramp_rate × (τc + L)` above), so the integrator wakes up only once the P
+  term is already tapering.
+- `pid.i_clamp_w` — how much power the integrator may ever add or remove,
+  500 W as shipped. Size it from the model error you expect the integrator to
+  cover, not from the elements: the feedforward supplies the holding power, so
+  this only has to absorb a wrong `ambient_c`, a drifting `k_loss`, or a lid
+  left off. Read `pid_i_w` from a good run and leave a few times its peak; if
+  the log shows it sitting pinned at ±`i_clamp_w` while a real offset
+  persists, the feedforward is wrong — fix `[feedforward]` rather than raising
+  the clamp.
 
 **Grain-in gains.** Adding grain changes the plant (more mass, worse mixing,
 scorch risk at the bag). Re-run the heat/cool test with grain in (or a sacrificial

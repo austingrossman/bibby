@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--headless")) headless = true;
     else if (!strcmp(argv[i], "--ui-test")) ui_test = true;  // panel bring-up screen
-    else if (!strcmp(argv[i], "--sim-zc")) sim_zc = true;    // bench: no mains
+    else if (!strcmp(argv[i], "--sim-zc")) sim_zc = true;    // bench: forces mains.simulate_zc on
     else if (!strcmp(argv[i], "--manual-w") && i + 1 < argc)
       manual_w = (float)atof(argv[++i]);  // bench/step-test: manual watts at start
     else if (!strcmp(argv[i], "-c") && i + 1 < argc) config_path = argv[++i];
@@ -135,7 +135,13 @@ int main(int argc, char **argv) {
           cfg.mains_hz, (double)cfg.element1_watts, (double)cfg.element2_watts);
 
   state_init(&g_state);
-  atomic_store(&g_state.simulate_zc, sim_zc);
+  // Bench zero-cross simulation is a config decision (mains.simulate_zc);
+  // --sim-zc forces it on for one run. There is no operator control for it.
+  atomic_store(&g_state.simulate_zc, sim_zc || cfg.mains_simulate_zc);
+  if (sim_zc || cfg.mains_simulate_zc)
+    fprintf(stderr, "bibby: ZERO-CROSS SIMULATION ON (%s) - the mains-loss "
+                    "watchdog cannot trip; bench use only\n",
+            sim_zc ? "--sim-zc" : "mains.simulate_zc");
   atomic_store(&g_state.manual_power_w, manual_w);  // manual mode is the default
 
   struct sigaction sa = {0};

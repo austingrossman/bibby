@@ -23,6 +23,10 @@ void pid_set_i_band(Pid *pid, float i_band_c) {
   pid->i_band_c = i_band_c > 0.0f ? i_band_c : 0.0f;
 }
 
+void pid_set_i_clamp(Pid *pid, float i_clamp_w) {
+  pid->i_clamp_w = i_clamp_w > 0.0f ? i_clamp_w : 0.0f;
+}
+
 void pid_set_gains(Pid *pid, float kp, float ki, float kd) {
   pid->kp = kp;
   pid->ki = ki;
@@ -53,14 +57,20 @@ float pid_update(Pid *pid, float temp_c, float setpoint_c, float ff_w,
   // Integral separation: outside the band the integrator holds. See control.h.
   int   outside_band = pid->i_band_c > 0.0f &&
                        (error > pid->i_band_c || error < -pid->i_band_c);
-  if (!sat_high && !sat_low && !outside_band) {
-    pid->integral += error;
-    // Backstop: bound the integral term to full output authority, so a long
-    // saturated fault cannot wind it beyond anything the clamp can express.
-    if (pid->ki > 0.0f) {
-      float integral_max = out_max_w / pid->ki;
-      pid->integral = clampf(pid->integral, -integral_max, integral_max);
+  if (!sat_high && !sat_low && !outside_band) pid->integral += error;
+
+  // Bound the integrator every step, held or not, so a gain or clamp change
+  // cannot leave a stale oversized state in place. Two limits, tighter wins:
+  // the configured +/- i_clamp_w on the integral term, and the backstop of
+  // full output authority, which keeps a long saturated fault from winding it
+  // beyond anything the output clamp can express.
+  if (pid->ki > 0.0f) {
+    float integral_max = out_max_w / pid->ki;
+    if (pid->i_clamp_w > 0.0f) {
+      float clamp_max = pid->i_clamp_w / pid->ki;
+      if (clamp_max < integral_max) integral_max = clamp_max;
     }
+    pid->integral = clampf(pid->integral, -integral_max, integral_max);
   }
 
   float i   = pid->ki * pid->integral;

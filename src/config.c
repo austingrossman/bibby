@@ -12,6 +12,7 @@ const char *config_resolved_path(void) { return resolved_path; }
 
 static void set_defaults(BibbyConfig *cfg) {
   cfg->mains_hz          = 60;
+  cfg->mains_simulate_zc = false;  // real mains sense; bench mode is opt-in
   cfg->element1_watts    = 2500.0f;
   cfg->element2_watts    = 2500.0f;
   cfg->element1_area_cm2 = 150.0f;
@@ -33,7 +34,6 @@ static void set_defaults(BibbyConfig *cfg) {
   cfg->filter_window     = 40;
   cfg->log_high_rate     = true;
   cfg->log_low_period_s  = 2.0f;
-  cfg->ui_show_zc_sim    = true;
   cfg->ui_chart_window_min = 5.0f;
   cfg->ui_rotation       = 90;
   snprintf(cfg->ui_fb_device,    sizeof(cfg->ui_fb_device),    "auto");
@@ -46,6 +46,7 @@ static void set_defaults(BibbyConfig *cfg) {
   snprintf(cfg->web_user,     sizeof(cfg->web_user),     "brewer");
   cfg->web_password[0]   = '\0';   // empty = server refuses to start
   cfg->pid_i_band_c           = 0.0f;   // off: classic PI until the ini sets it
+  cfg->pid_i_clamp_w          = 0.0f;   // off: only the max_power/ki backstop
   cfg->adaptive_enable        = false;
   cfg->adaptive_m_ref_l       = 0.0f;
   cfg->adaptive_scale_min     = 0.5f;
@@ -70,6 +71,7 @@ static bool parse_bool(const char *val) {
 // Unrecognized keys are silently ignored so the file can carry comments/extras.
 static void apply(BibbyConfig *cfg, const char *key, const char *val) {
   if      (!strcmp(key, "mains.frequency_hz")) cfg->mains_hz          = atoi(val);
+  else if (!strcmp(key, "mains.simulate_zc"))  cfg->mains_simulate_zc = parse_bool(val);
   else if (!strcmp(key, "element1.watts"))     cfg->element1_watts    = (float)atof(val);
   else if (!strcmp(key, "element2.watts"))     cfg->element2_watts    = (float)atof(val);
   else if (!strcmp(key, "element1.area_cm2"))  cfg->element1_area_cm2 = (float)atof(val);
@@ -79,6 +81,7 @@ static void apply(BibbyConfig *cfg, const char *key, const char *val) {
   else if (!strcmp(key, "pid.ki"))             cfg->pid_ki            = (float)atof(val);
   else if (!strcmp(key, "pid.kd"))             cfg->pid_kd            = (float)atof(val);
   else if (!strcmp(key, "pid.i_band_c"))       cfg->pid_i_band_c      = (float)atof(val);
+  else if (!strcmp(key, "pid.i_clamp_w"))      cfg->pid_i_clamp_w     = (float)atof(val);
   else if (!strcmp(key, "grain.kp"))           cfg->grain_kp          = (float)atof(val);
   else if (!strcmp(key, "grain.ki"))           cfg->grain_ki          = (float)atof(val);
   else if (!strcmp(key, "grain.kd"))           cfg->grain_kd          = (float)atof(val);
@@ -92,7 +95,6 @@ static void apply(BibbyConfig *cfg, const char *key, const char *val) {
   else if (!strcmp(key, "filter.window"))      cfg->filter_window     = atoi(val);
   else if (!strcmp(key, "logging.rate"))       cfg->log_high_rate     = !strcmp(val, "high");
   else if (!strcmp(key, "logging.low_period_s")) cfg->log_low_period_s = (float)atof(val);
-  else if (!strcmp(key, "ui.show_zc_sim"))     cfg->ui_show_zc_sim    = parse_bool(val);
   else if (!strcmp(key, "ui.chart_window_min")) cfg->ui_chart_window_min = (float)atof(val);
   else if (!strcmp(key, "ui.rotation"))        cfg->ui_rotation       = atoi(val);
   else if (!strcmp(key, "ui.fb_device"))       snprintf(cfg->ui_fb_device, sizeof(cfg->ui_fb_device), "%s", val);

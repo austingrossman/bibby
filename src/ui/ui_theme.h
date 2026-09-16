@@ -8,7 +8,9 @@
 #define UI_BORDER    0x39434f
 #define UI_TEXT      0xe8ecf1
 #define UI_TEXT_DIM  0x9aa4b0
+#define UI_TEXT_MID  0xc3ccd8   // one step down from UI_TEXT (the degF readout)
 #define UI_GREEN     0x37c871   // ok / active / setpoint
+#define UI_GREEN_DIM 0x2a9a5c   // the setpoint's secondary (degF) line
 #define UI_AMBER     0xffb020   // grain, warnings
 #define UI_RED       0xff4b3e   // faults, alarms
 #define UI_BLUE      0x4aa8ff   // P term, mode markers

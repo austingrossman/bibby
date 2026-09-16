@@ -43,6 +43,7 @@ void *sampler_thread_main(void *arg) {
   Pid pid;
   pid_init(&pid, cfg->pid_kp, cfg->pid_ki, cfg->pid_kd);
   pid_set_i_band(&pid, cfg->pid_i_band_c);
+  pid_set_i_clamp(&pid, cfg->pid_i_clamp_w);
 
   MassEstimator mass;
   // Ignore rise windows below 10% of rated power — too little signal.

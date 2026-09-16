@@ -1,3 +1,4 @@
 build/
 logs/
 ._*
+__pycache__

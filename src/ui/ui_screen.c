@@ -1,17 +1,21 @@
 // Main bibby screen, 1280x720 logical (sideways 720x1280 panel).
 //
 //  +------------------------------+-------+--------------------+
-//  | toggles      | set-pt steps  | POWER |  Set 65.0 C        |
-//  |--------------+---------------| slider|   [ kettle ]       |
-//  | temperature chart            |       |    65.32 C         |
-//  |------------------------------|       |    149.6 F         |
-//  | power / PID-term chart       |       |   (elements glow)  |
-//  | fault band       | status    |       |  E1 50%   E2 50%   |
-//  +------------------------------+-------+--------------------+
+//  | Grain | Manual | set-pt steps | POWER |  Set 65.0 C        |
+//  |  In   | Control|              | slider|     149.0 F        |
+//  | legend chips                 |       |    65.32 C         |
+//  | temperature chart            |       |    149.58 F        |
+//  | -5m ............... now      |       |  [ kettle, m L/gal]|
+//  | legend chips                 |       |   (elements glow)  |
+//  | power / PID-term chart       |       |                    |
+//  | -5m ............... now      |       |  E1 50%   E2 50%   |
+//  +------------------------------+-------+  gain x1.00        +
 //
 // The UI is a pure view/controller: it reads the shared state snapshot and
-// writes setpoint / mode / manual watts / grain / sim-zc. Nothing here is in
-// the control or safety path.
+// writes setpoint / mode / manual watts / grain. Nothing here is in the
+// control or safety path. Zero-cross simulation is deliberately NOT on this
+// screen: it is a commissioning setting (mains.simulate_zc in bibby.ini), so
+// nobody can disarm the mains-loss watchdog with a stray tap mid-brew.
 #include "ui_screen.h"
 
 #include <stdint.h>
@@ -28,13 +32,27 @@
 #define TRACE_W      2  // every chart trace (LV_PART_ITEMS line width)
 #define TRACE_W_FILT 4  // except the filtered temperature, the one to read
 
+// Chart column: two stacked panes, each with a legend row above and a time
+// scale below, filling 194..714 of the 720 px screen.
+#define CHART_T_Y 246
+#define CHART_T_H 222
+#define CHART_P_Y 546
+#define CHART_P_H 148
+
+// Right-hand column: the charts end at x=780, the screen at 1280.
+#define SLIDER_X 796
+#define SLIDER_W 104
+#define KETTLE_X 912
+#define KETTLE_W 358
+
 static BibbyState        *ST;
 static const BibbyConfig *CFG;
 
 static struct {
-  lv_obj_t *btn_manual, *btn_zc_sim, *btn_grain;
+  lv_obj_t *btn_manual, *btn_grain;
   lv_obj_t *slider, *slider_watts;
-  lv_obj_t *lbl_setpoint, *lbl_temp_c, *lbl_temp_f, *lbl_elements;
+  lv_obj_t *lbl_setpoint, *lbl_setpoint_f;
+  lv_obj_t *lbl_temp_c, *lbl_temp_f, *lbl_elements;
   lv_obj_t *chart_temp, *chart_pow;
   lv_obj_t *ylab_temp[3], *ylab_pow[3];
   lv_obj_t *fault_band, *lbl_fault, *lbl_status;
@@ -99,7 +117,8 @@ static lv_obj_t *make_label(lv_obj_t *parent, int x, int y, const lv_font_t *fon
   return l;
 }
 
-// Big finger-sized toggle: grey when off, colored when on.
+// Big square finger-sized toggle: grey when off, colored when on. The label
+// may carry a newline; the two on this screen are sized for a gloved thumb.
 static lv_obj_t *make_toggle(lv_obj_t *parent, const char *txt, int x, int y,
                              int w, int h, uint32_t on_color,
                              lv_event_cb_t cb) {
@@ -109,11 +128,12 @@ static lv_obj_t *make_toggle(lv_obj_t *parent, const char *txt, int x, int y,
   lv_obj_add_flag(b, LV_OBJ_FLAG_CHECKABLE);
   lv_obj_set_style_bg_color(b, lv_color_hex(0x3a3a44), 0);
   lv_obj_set_style_bg_color(b, lv_color_hex(on_color), LV_STATE_CHECKED);
-  lv_obj_set_style_radius(b, 10, 0);
+  lv_obj_set_style_radius(b, 14, 0);
   lv_obj_set_style_shadow_width(b, 0, 0);
   lv_obj_t *l = lv_label_create(b);
   lv_label_set_text(l, txt);
-  lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(l);
   if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_VALUE_CHANGED, NULL);
   return b;
@@ -140,11 +160,6 @@ static void manual_toggle_cb(lv_event_t *e) {
     }
     atomic_store(&ST->manual_mode, false);
   }
-}
-
-static void zc_sim_toggle_cb(lv_event_t *e) {
-  lv_obj_t *btn = lv_event_get_target(e);
-  atomic_store(&ST->simulate_zc, lv_obj_has_state(btn, LV_STATE_CHECKED));
 }
 
 static void grain_toggle_cb(lv_event_t *e) {
@@ -205,14 +220,16 @@ static void legend_cb(lv_event_t *e) {
   lv_chart_hide_series(trace[idx].chart, *trace[idx].ser, !vis[idx]);
 }
 
+#define CHIP_H 46  // legend-chip height; the row is sized to match
+
 static lv_obj_t *make_legend_row(lv_obj_t *parent, int x, int y, int w) {
   lv_obj_t *r = lv_obj_create(parent);
   lv_obj_set_pos(r, x, y);
-  lv_obj_set_size(r, w, 30);
+  lv_obj_set_size(r, w, CHIP_H);
   lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(r, 0, 0);
   lv_obj_set_style_pad_all(r, 0, 0);
-  lv_obj_set_style_pad_column(r, 6, 0);
+  lv_obj_set_style_pad_column(r, 8, 0);
   lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
@@ -221,7 +238,8 @@ static lv_obj_t *make_legend_row(lv_obj_t *parent, int x, int y, int w) {
 }
 
 // One chip per trace: registers the series and starts visible. The chip is a
-// full-height 30 px button so it is still a fair touch target on the panel.
+// full-height CHIP_H button with a 20 px face, so it is a real touch target
+// rather than something to aim a fingernail at.
 static void make_chip(lv_obj_t *row, int idx, lv_obj_t *chart,
                       lv_chart_series_t **ser, uint32_t color,
                       const char *txt) {
@@ -230,10 +248,10 @@ static void make_chip(lv_obj_t *row, int idx, lv_obj_t *chart,
   vis[idx]         = true;
 
   lv_obj_t *b = lv_button_create(row);
-  lv_obj_set_size(b, LV_SIZE_CONTENT, 30);
-  lv_obj_set_style_min_width(b, 46, 0);
-  lv_obj_set_style_pad_hor(b, 9, 0);
-  lv_obj_set_style_radius(b, 6, 0);
+  lv_obj_set_size(b, LV_SIZE_CONTENT, CHIP_H);
+  lv_obj_set_style_min_width(b, 60, 0);
+  lv_obj_set_style_pad_hor(b, 14, 0);
+  lv_obj_set_style_radius(b, 8, 0);
   lv_obj_set_style_shadow_width(b, 0, 0);
   lv_obj_set_style_border_width(b, 1, 0);
   lv_obj_set_style_bg_color(b, lv_color_hex(UI_BG), 0);
@@ -251,10 +269,50 @@ static void make_chip(lv_obj_t *row, int idx, lv_obj_t *chart,
 
   lv_obj_t *l = lv_label_create(b);
   lv_label_set_text(l, txt);
-  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
   lv_obj_center(l);
   lv_obj_add_event_cb(b, legend_cb, LV_EVENT_VALUE_CHANGED,
                       (void *)(intptr_t)idx);
+}
+
+#define AXIS_TICKS 6  // one per vertical division line of the chart grid
+
+// Time scale under a chart. Both charts are right-aligned to "now" and span a
+// window fixed at startup, so the marks never move: draw them once. Positions
+// come from the chart's own content box, which is exactly what LVGL spreads
+// the division lines and the data points across, so every label lands on its
+// grid line. The end marks are pulled inside the chart so neither hangs over
+// the y-axis labels on the left or the power slider on the right.
+static void make_time_axis(lv_obj_t *parent, lv_obj_t *chart, int y,
+                           float window_min) {
+  lv_obj_update_layout(chart);
+  const int px0 = lv_obj_get_x(chart) +
+                  lv_obj_get_style_pad_left(chart, LV_PART_MAIN) +
+                  lv_obj_get_style_border_width(chart, LV_PART_MAIN);
+  const int pxw = lv_obj_get_content_width(chart);
+  const int lw  = 72;
+
+  for (int i = 0; i < AXIS_TICKS; i++) {
+    float ago = window_min * (float)(AXIS_TICKS - 1 - i) / (AXIS_TICKS - 1);
+    int   min = (int)ago;
+    int   sec = (int)((ago - (float)min) * 60.0f + 0.5f);
+    char  t[16];
+    if (ago < 0.005f)                      snprintf(t, sizeof(t), "now");
+    else if (sec == 0 || sec == 60)        snprintf(t, sizeof(t), "-%dm",
+                                                    (int)(ago + 0.005f));
+    else                                   snprintf(t, sizeof(t), "-%d:%02d",
+                                                    min, sec);
+
+    int             lx = px0 + (pxw * i) / (AXIS_TICKS - 1) - lw / 2;
+    lv_text_align_t al = LV_TEXT_ALIGN_CENTER;
+    if (i == 0)                   { lx = px0;             al = LV_TEXT_ALIGN_LEFT; }
+    else if (i == AXIS_TICKS - 1) { lx = px0 + pxw - lw;  al = LV_TEXT_ALIGN_RIGHT; }
+
+    lv_obj_t *l = make_label(parent, lx, y, &lv_font_montserrat_14,
+                             UI_TEXT_DIM, t);
+    lv_obj_set_width(l, lw);
+    lv_obj_set_style_text_align(l, al, 0);
+  }
 }
 
 static void fold(int32_t v, int32_t *lo, int32_t *hi) {
@@ -268,7 +326,7 @@ static lv_obj_t *make_chart(lv_obj_t *parent, int x, int y, int w, int h) {
   lv_obj_set_size(c, w, h);
   lv_chart_set_type(c, LV_CHART_TYPE_LINE);
   lv_chart_set_point_count(c, S.chart_pts);
-  lv_chart_set_div_line_count(c, 5, 7);
+  lv_chart_set_div_line_count(c, 5, 6);  // 6 verticals = the AXIS_TICKS marks
   lv_obj_set_style_bg_color(c, lv_color_hex(UI_PANEL), 0);
   lv_obj_set_style_border_color(c, lv_color_hex(UI_BORDER), 0);
   lv_obj_set_style_line_color(c, lv_color_hex(0x262e38), LV_PART_MAIN);
@@ -401,14 +459,16 @@ static void refresh_cb(lv_timer_t *t) {
   // LVGL's own printf has no float support; format with libc instead.
   snprintf(txt, sizeof(txt), "Set %.1f°C", (double)sp);
   lv_label_set_text(S.lbl_setpoint, txt);
+  snprintf(txt, sizeof(txt), "%.1f°F", (double)(sp * 9.0f / 5.0f + 32.0f));
+  lv_label_set_text(S.lbl_setpoint_f, txt);
   if (valid) {
     snprintf(txt, sizeof(txt), "%.2f°C", (double)temp);
     lv_label_set_text(S.lbl_temp_c, txt);
-    snprintf(txt, sizeof(txt), "%.1f°F", (double)(temp * 9.0f / 5.0f + 32.0f));
+    snprintf(txt, sizeof(txt), "%.2f°F", (double)(temp * 9.0f / 5.0f + 32.0f));
     lv_label_set_text(S.lbl_temp_f, txt);
   } else {
     lv_label_set_text(S.lbl_temp_c, "--.--°C");
-    lv_label_set_text(S.lbl_temp_f, "--.-°F");
+    lv_label_set_text(S.lbl_temp_f, "--.--°F");
   }
 
   // Element glow tracks the commanded duty (the fired-state average), eased
@@ -476,12 +536,13 @@ static void refresh_cb(lv_timer_t *t) {
     lv_obj_add_flag(S.fault_band, LV_OBJ_FLAG_HIDDEN);
   }
 
-  // Status line: batch-size estimate (litres of water) and gain scale.
-  float m_l = atomic_load(&ST->m_est_l);
+  // Batch-size estimate rides on the kettle contents (litres and gallons);
+  // the status line keeps the gain scale it drives.
+  float m_l   = atomic_load(&ST->m_est_l);
   float scale = atomic_load(&ST->adaptive_scale);
+  ui_kettle_set_mass(m_l);
   if (m_l > 0.0f) {
-    snprintf(txt, sizeof(txt), "m %.1f L  x%.2f",
-             (double)m_l, (double)scale);
+    snprintf(txt, sizeof(txt), "gain x%.2f", (double)scale);
     lv_label_set_text(S.lbl_status, txt);
   } else {
     lv_label_set_text(S.lbl_status, "");
@@ -512,13 +573,12 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
   lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
   // ── Toggles (top-left) ──
-  bool zc_sim = cfg->ui_show_zc_sim;
-  S.btn_zc_sim = zc_sim ? make_toggle(scr, "ZC Sim", 10, 10, 180, 75,
-                                      UI_BLUE, zc_sim_toggle_cb)
-                        : NULL;
-  S.btn_grain  = make_toggle(scr, "Grain In", zc_sim ? 200 : 10, 10,
-                             zc_sim ? 180 : 370, 75, UI_AMBER, grain_toggle_cb);
-  S.btn_manual = make_toggle(scr, "Manual Control", 10, 95, 370, 75,
+  // Two near-square pads filling the block the three old toggles shared, so
+  // the two switches that matter mid-brew are the easiest targets on the
+  // screen. They line up with the two rows of setpoint steppers beside them.
+  S.btn_grain  = make_toggle(scr, "Grain\nIn", 10, 10, 180, 160,
+                             UI_AMBER, grain_toggle_cb);
+  S.btn_manual = make_toggle(scr, "Manual\nControl", 200, 10, 180, 160,
                              UI_GREEN, manual_toggle_cb);
   lv_obj_add_state(S.btn_manual, LV_STATE_CHECKED);  // manual is the default
 
@@ -540,19 +600,28 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
   }
 
   // ── Charts ──
-  S.chart_temp = make_chart(scr, 70, 205, 710, 245);
-  S.chart_pow  = make_chart(scr, 70, 483, 710, 175);
+  // Vertical budget below the toggles (which end at 170), running all the way
+  // to the bottom edge so no dead strip is left under the power chart:
+  //   194 legend   246 temp chart   470 time axis
+  //   494 legend   546 power chart  696 time axis   714 bottom
+  // The 24 px above the first legend row keeps the chips clear of the Manual
+  // Control pad — a thumb that slides off the button must not hit a chip.
+  S.chart_temp = make_chart(scr, 70, CHART_T_Y, 710, CHART_T_H);
+  S.chart_pow  = make_chart(scr, 70, CHART_P_Y, 710, CHART_P_H);
 
   for (int i = 0; i < 3; i++) {
-    S.ylab_temp[i] = make_label(scr, 4, 205 + i * 110, &lv_font_montserrat_14,
-                                UI_TEXT_DIM, "");
+    S.ylab_temp[i] = make_label(scr, 4, CHART_T_Y + 2 + i * (CHART_T_H - 22) / 2,
+                                &lv_font_montserrat_14, UI_TEXT_DIM, "");
     lv_obj_set_width(S.ylab_temp[i], 62);
     lv_obj_set_style_text_align(S.ylab_temp[i], LV_TEXT_ALIGN_RIGHT, 0);
-    S.ylab_pow[i] = make_label(scr, 4, 483 + i * 76, &lv_font_montserrat_14,
-                               UI_TEXT_DIM, "");
+    S.ylab_pow[i] = make_label(scr, 4, CHART_P_Y + 2 + i * (CHART_P_H - 22) / 2,
+                               &lv_font_montserrat_14, UI_TEXT_DIM, "");
     lv_obj_set_width(S.ylab_pow[i], 62);
     lv_obj_set_style_text_align(S.ylab_pow[i], LV_TEXT_ALIGN_RIGHT, 0);
   }
+
+  make_time_axis(scr, S.chart_temp, CHART_T_Y + CHART_T_H + 4, mins);
+  make_time_axis(scr, S.chart_pow,  CHART_P_Y + CHART_P_H + 2, mins);
 
   // LVGL walks the series list back to front, so the first one added is drawn
   // last, on top: setpoint over the filtered temperature over raw, with the
@@ -574,7 +643,7 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
   S.s_demand = add_series(S.chart_pow, UI_ORANGE, a_demand);
 
   // ── Legends: tap a chip to drop that trace off its chart ──
-  lv_obj_t *leg1 = make_legend_row(scr, 70, 173, 710);
+  lv_obj_t *leg1 = make_legend_row(scr, 70, 194, 710);
   make_chip(leg1, V_SET,   S.chart_temp, &S.s_set,      UI_GREEN, "setpoint");
   make_chip(leg1, V_FILT,  S.chart_temp, &S.s_filt,     UI_TRACE, "temp");
   make_chip(leg1, V_RAW,   S.chart_temp, &S.s_raw,      0x9aa4b0, "raw");
@@ -583,28 +652,39 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
   make_chip(leg1, V_GRAIN, S.chart_temp, &S.s_grain_ev, UI_AMBER, "grain event");
   make_chip(leg1, V_MODE,  S.chart_temp, &S.s_mode_ev,  UI_BLUE,  "mode event");
 
-  lv_obj_t *leg2 = make_legend_row(scr, 70, 451, 710);
+  lv_obj_t *leg2 = make_legend_row(scr, 70, 494, 710);
   make_chip(leg2, V_DEMAND, S.chart_pow, &S.s_demand, UI_ORANGE, "demand W");
   make_chip(leg2, V_FF,     S.chart_pow, &S.s_ff,     UI_TEAL,   "ff");
   make_chip(leg2, V_P,      S.chart_pow, &S.s_p,      UI_BLUE,   "P");
   make_chip(leg2, V_I,      S.chart_pow, &S.s_i,      UI_VIOLET, "I");
   make_chip(leg2, V_D,      S.chart_pow, &S.s_d,      0x9aa4b0,  "D");
 
-  // ── Fault band + status (bottom-left) ──
-  S.fault_band = make_panel(scr, 10, 668, 590, 46);
+  // ── Fault band ──
+  // Hidden almost always, so it gets no reserved strip of its own: it floats
+  // over the lower power chart when it appears (created after the charts, so
+  // it draws on top). Losing a third of the power pane during a fault costs
+  // nothing — the loop is at zero watts by then.
+  S.fault_band = make_panel(scr, 70, 640, 710, 48);
   lv_obj_set_style_bg_color(S.fault_band, lv_color_hex(0x3a1512), 0);
   lv_obj_set_style_border_color(S.fault_band, lv_color_hex(UI_RED), 0);
-  S.lbl_fault = make_label(S.fault_band, 10, 4, &lv_font_montserrat_14, UI_RED, "");
+  S.lbl_fault = make_label(S.fault_band, 10, 5, &lv_font_montserrat_14, UI_RED, "");
   lv_label_set_long_mode(S.lbl_fault, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(S.lbl_fault, 570);
+  lv_obj_set_width(S.lbl_fault, 690);
   lv_obj_add_flag(S.fault_band, LV_OBJ_FLAG_HIDDEN);
-  S.lbl_status = make_label(scr, 610, 684, &lv_font_montserrat_14, UI_TEXT_DIM, "");
 
   // ── Power slider ──
-  make_label(scr, 806, 14, &lv_font_montserrat_16, UI_TEXT_DIM, "POWER");
+  // Wide on purpose: this is the one continuous control on a touchscreen, and
+  // 104 px of track is a thumb's worth. It takes most of the gap that used to
+  // sit between the slider and the kettle. LVGL centers the knob on the value,
+  // so it overhangs each end by half the slider width (52 px) — the label
+  // above and the readout below are placed clear of that.
+  lv_obj_t *pwr = make_label(scr, SLIDER_X, 10, &lv_font_montserrat_16,
+                             UI_TEXT_DIM, "POWER");
+  lv_obj_set_width(pwr, SLIDER_W);
+  lv_obj_set_style_text_align(pwr, LV_TEXT_ALIGN_CENTER, 0);
   S.slider = lv_slider_create(scr);
-  lv_obj_set_pos(S.slider, 812, 75);   // knob overhang must clear "POWER"
-  lv_obj_set_size(S.slider, 56, 570);
+  lv_obj_set_pos(S.slider, SLIDER_X, 92);
+  lv_obj_set_size(S.slider, SLIDER_W, 536);
   lv_slider_set_range(S.slider, 0, (int32_t)S.max_watts);
   lv_slider_set_value(S.slider, (int32_t)atomic_load(&st->manual_power_w),
                       LV_ANIM_OFF);
@@ -612,28 +692,48 @@ void ui_screen_create(BibbyState *st, const BibbyConfig *cfg) {
   lv_obj_set_style_bg_color(S.slider, lv_color_hex(UI_ORANGE), LV_PART_INDICATOR);
   lv_obj_set_style_bg_color(S.slider, lv_color_hex(UI_TEXT), LV_PART_KNOB);
   lv_obj_add_event_cb(S.slider, slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
-  S.slider_watts = make_label(scr, 790, 692, &lv_font_montserrat_20, UI_TEXT, "0 W");
-  lv_obj_set_width(S.slider_watts, 100);
+  S.slider_watts = make_label(scr, SLIDER_X, 688, &lv_font_montserrat_20,
+                              UI_TEXT, "0 W");
+  lv_obj_set_width(S.slider_watts, SLIDER_W);
   lv_obj_set_style_text_align(S.slider_watts, LV_TEXT_ALIGN_CENTER, 0);
 
   // ── Kettle column ──
-  S.lbl_setpoint = make_label(scr, 900, 10, &lv_font_montserrat_32, UI_GREEN, "");
-  lv_obj_set_width(S.lbl_setpoint, 370);
+  // Pushed right against the screen edge and down, both to close the gap the
+  // widened slider left and to give the setpoint block room above the kettle.
+  S.lbl_setpoint = make_label(scr, KETTLE_X, 6, &lv_font_montserrat_36,
+                              UI_GREEN, "");
+  lv_obj_set_width(S.lbl_setpoint, KETTLE_W);
   lv_obj_set_style_text_align(S.lbl_setpoint, LV_TEXT_ALIGN_CENTER, 0);
+  S.lbl_setpoint_f = make_label(scr, KETTLE_X, 50, &lv_font_montserrat_28,
+                                UI_GREEN_DIM, "");
+  lv_obj_set_width(S.lbl_setpoint_f, KETTLE_W);
+  lv_obj_set_style_text_align(S.lbl_setpoint_f, LV_TEXT_ALIGN_CENTER, 0);
 
-  lv_obj_t *kettle = ui_kettle_create(scr, 370, 560);
-  lv_obj_set_pos(kettle, 900, 55);
+  lv_obj_t *kettle = ui_kettle_create(scr, KETTLE_W, 560);
+  lv_obj_set_pos(kettle, KETTLE_X, 92);
 
-  S.lbl_temp_c = make_label(scr, 900, 130, &lv_font_montserrat_48, UI_TEXT, "");
-  lv_obj_set_width(S.lbl_temp_c, 370);
+  // Both readouts at the same size — the same measurement in two units, not a
+  // primary and a footnote. °F is one step darker so °C still reads first.
+  S.lbl_temp_c = make_label(scr, KETTLE_X, 132, &lv_font_montserrat_48,
+                            UI_TEXT, "");
+  lv_obj_set_width(S.lbl_temp_c, KETTLE_W);
   lv_obj_set_style_text_align(S.lbl_temp_c, LV_TEXT_ALIGN_CENTER, 0);
-  S.lbl_temp_f = make_label(scr, 900, 185, &lv_font_montserrat_32, UI_TEXT_DIM, "");
-  lv_obj_set_width(S.lbl_temp_f, 370);
+  S.lbl_temp_f = make_label(scr, KETTLE_X, 196, &lv_font_montserrat_48,
+                            UI_TEXT_MID, "");
+  lv_obj_set_width(S.lbl_temp_f, KETTLE_W);
   lv_obj_set_style_text_align(S.lbl_temp_f, LV_TEXT_ALIGN_CENTER, 0);
 
-  S.lbl_elements = make_label(scr, 900, 625, &lv_font_montserrat_20, UI_TEXT_DIM, "");
-  lv_obj_set_width(S.lbl_elements, 370);
+  S.lbl_elements = make_label(scr, KETTLE_X, 660, &lv_font_montserrat_20,
+                              UI_TEXT_DIM, "");
+  lv_obj_set_width(S.lbl_elements, KETTLE_W);
   lv_obj_set_style_text_align(S.lbl_elements, LV_TEXT_ALIGN_CENTER, 0);
+
+  // The gain scale closes out the kettle column; the batch-size estimate that
+  // drives it is on the contents above.
+  S.lbl_status = make_label(scr, KETTLE_X, 690, &lv_font_montserrat_14,
+                            UI_TEXT_DIM, "");
+  lv_obj_set_width(S.lbl_status, KETTLE_W);
+  lv_obj_set_style_text_align(S.lbl_status, LV_TEXT_ALIGN_CENTER, 0);
 
   lv_timer_create(refresh_cb, 250, NULL);
   refresh_cb(NULL);
